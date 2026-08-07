@@ -37,36 +37,46 @@ _CLIMATE_CATEGORIES = {"kt", "qn"}
 _LIGHT_CATEGORIES = {"dj"}
 _VACUUM_CATEGORIES = {"sd"}
 
+# Tuples, not sets: order is the preference order when a device happens to
+# expose more than one candidate code for the same role (e.g. both swing
+# axes) - `_find_role` takes the first match, so first-listed wins.
 _CLIMATE_ROLE_CODES = {
-    "power": {"switch", "power", "switch_1"},
-    "target_temp": {"temp_set"},
-    "current_temp": {"temp_current"},
-    "mode": {"mode", "work_mode"},
-    "fan": {"windspeed", "fan_speed", "level", "speed"},
-    "humidity": {"humidity_current"},
+    "power": ("switch", "power", "switch_1"),
+    "target_temp": ("temp_set",),
+    "current_temp": ("temp_current",),
+    "mode": ("mode", "work_mode"),
+    "fan": ("windspeed", "fan_speed", "level", "speed"),
+    "humidity": ("humidity_current",),
+    # intensity-style modes that aren't real off/heat/cool HVAC modes (e.g.
+    # a heater's High/Low, an AC's sleep timer curve) -> preset_mode instead
+    "preset": ("sleep",),
+    # only ONE swing axis is modeled (HA's climate entity has a single
+    # swing_mode dimension) - up/down preferred over left/right when a
+    # device has both; the other stays a plain dps: select entry.
+    "swing": ("up_down_sweep", "swing", "shake", "left_right_sweep"),
 }
 _LIGHT_ROLE_CODES = {
-    "power": {"switch_led", "switch", "switch_1", "power"},
-    "brightness": {"bright_value_v2", "bright_value"},
-    "color_temp": {"temp_value_v2", "temp_value"},
-    "color": {"colour_data_v2", "colour_data"},
-    "work_mode": {"work_mode"},
+    "power": ("switch_led", "switch", "switch_1", "power"),
+    "brightness": ("bright_value_v2", "bright_value"),
+    "color_temp": ("temp_value_v2", "temp_value"),
+    "color": ("colour_data_v2", "colour_data"),
+    "work_mode": ("work_mode",),
 }
 _VACUUM_ROLE_CODES = {
-    "start": {"power_go", "start_clean", "start"},
-    "pause": {"pause"},
-    "return": {"switch_charge", "return_home", "go_home"},
-    "locate": {"find_robot", "findrobot", "seek"},
-    "battery": {"electricity_left", "electricity", "battery_percentage"},
-    "status": {"status", "workstatus", "work_status"},
-    "fan_speed": {"suction", "fanstatus", "fan_speed", "cistern"},
+    "start": ("power_go", "start_clean", "start"),
+    "pause": ("pause",),
+    "return": ("switch_charge", "return_home", "go_home"),
+    "locate": ("find_robot", "findrobot", "seek"),
+    "battery": ("electricity_left", "electricity", "battery_percentage"),
+    "status": ("status", "workstatus", "work_status"),
+    "fan_speed": ("suction", "fanstatus", "fan_speed", "cistern"),
 }
 
 
-def _find_role(by_code: dict[str, dict], role_codes: dict[str, set[str]]) -> dict[str, dict]:
+def _find_role(by_code: dict[str, dict], role_codes: dict[str, tuple[str, ...]]) -> dict[str, dict]:
     """Return {role: schema_entry} for whichever roles matched a code
     present on this device (case-insensitive match against the device's
-    real codes)."""
+    real codes). `role_codes` values are ORDERED - first match wins."""
     lower_map = {code.lower(): code for code in by_code}
     found = {}
     for role, candidates in role_codes.items():
@@ -82,7 +92,12 @@ def _humanize(code: str) -> str:
     return " ".join(w.upper() if w.lower() in ("led", "id", "ac", "rgb") else w.capitalize() for w in words if w)
 
 
-def _try_build_climate(by_code: dict[str, dict], consumed: set[str]) -> ClimateMapping | None:
+_PLAUSIBLE_SETPOINT_MAX_C = 50  # no real consumer AC/heater setpoint goes above this
+
+
+def _try_build_climate(
+    by_code: dict[str, dict], consumed: set[str], warnings: list[str]
+) -> ClimateMapping | None:
     roles = _find_role(by_code, _CLIMATE_ROLE_CODES)
     if "power" not in roles or "target_temp" not in roles:
         return None  # not enough of a real thermostat shape to justify one entity
@@ -103,6 +118,21 @@ def _try_build_climate(by_code: dict[str, dict], consumed: set[str]) -> ClimateM
     if values.get("step") is not None:
         cm.target_temp_step = (values["step"] / scale) if scale else values["step"]
     consumed.add(t["code"])
+
+    # Sanity check, not a correction: Tuya's own cloud metadata has been
+    # observed to be flatly wrong here (a real AC's declared max was 88 -
+    # copy-pasted from its parallel Fahrenheit DP's range). Never silently
+    # invent a "fixed" number - that would be its own kind of black box -
+    # just make the implausible value impossible to miss in the reviewed
+    # YAML instead of relying on a generic boilerplate warning nobody reads.
+    if cm.target_temp_max > _PLAUSIBLE_SETPOINT_MAX_C:
+        warnings.append(
+            f"climate '{t['code']}' (dp {cm.target_temp_dp}): declared max "
+            f"temperature is {cm.target_temp_max}°C - implausible for a "
+            f"thermostat setpoint, Tuya's cloud metadata is very likely "
+            f"wrong here (a real example: 88°C copy-pasted from a parallel "
+            f"Fahrenheit DP). Fix `target_temp_max` below before saving."
+        )
 
     if "current_temp" in roles:
         c = roles["current_temp"]
@@ -138,6 +168,22 @@ def _try_build_climate(by_code: dict[str, dict], consumed: set[str]) -> ClimateM
         h = roles["humidity"]
         cm.humidity_dp = h["dp_id"]
         consumed.add(h["code"])
+
+    if "preset" in roles:
+        p = roles["preset"]
+        raw_range = p.get("values", {}).get("range", [])
+        if raw_range:
+            cm.preset_dp = p["dp_id"]
+            cm.preset_map = {raw: _humanize(raw) for raw in raw_range}
+            consumed.add(p["code"])
+
+    if "swing" in roles:
+        sw = roles["swing"]
+        raw_range = sw.get("values", {}).get("range", [])
+        if raw_range:
+            cm.swing_dp = sw["dp_id"]
+            cm.swing_map = {raw: _humanize(raw) for raw in raw_range}
+            consumed.add(sw["code"])
 
     return cm
 
@@ -301,16 +347,21 @@ def _auto_dp_mapping(entry: dict[str, Any]) -> DPMapping | None:
 
 def build_profile_from_schema(
     name: str, category: str | None, product_id: str | None, schema: list[dict[str, Any]]
-) -> DeviceProfile:
+) -> tuple[DeviceProfile, list[str]]:
+    """Returns (profile, warnings). `warnings` flags specific fields worth
+    double-checking (e.g. an implausible numeric range straight from Tuya's
+    own cloud metadata) - surfaced prominently by the config flow instead
+    of relying on a generic "review this" boilerplate nobody reads twice."""
     by_code = {e["code"]: e for e in schema}
     consumed: set[str] = set()
+    warnings: list[str] = []
 
     lights: list[LightMapping] = []
     climates: list[ClimateMapping] = []
     vacuums: list[VacuumMapping] = []
 
     if category in _CLIMATE_CATEGORIES:
-        if (cm := _try_build_climate(by_code, consumed)) is not None:
+        if (cm := _try_build_climate(by_code, consumed, warnings)) is not None:
             climates.append(cm)
     elif category in _LIGHT_CATEGORIES:
         if (lm := _try_build_light(by_code, consumed)) is not None:
@@ -327,7 +378,7 @@ def build_profile_from_schema(
         if mapping is not None
     ]
 
-    return DeviceProfile(
+    profile = DeviceProfile(
         name=name,
         dps=dps,
         lights=lights,
@@ -335,3 +386,4 @@ def build_profile_from_schema(
         vacuums=vacuums,
         product_ids=[product_id] if product_id else [],
     )
+    return profile, warnings

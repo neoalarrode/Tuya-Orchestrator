@@ -177,6 +177,14 @@ class ClimateMapping:
     preset_dp: int | None = None
     preset_map: dict[str, str] | None = None
     humidity_dp: int | None = None  # display-only current_humidity
+    # swing_dp + swing_map: raw <-> label, exposed as
+    # ClimateEntityFeature.SWING_MODE. Some ACs have two independent swing
+    # axes (up/down AND left/right) - only one is modeled here (HA's
+    # climate entity has a single swing_mode dimension); if a device
+    # exposes both, only the first one auto-detected becomes swing_dp, the
+    # other is left as a plain dps: select entry.
+    swing_dp: int | None = None
+    swing_map: dict[str, str] | None = None
     icon: str | None = None
 
 
@@ -288,6 +296,8 @@ def parse_profile(yaml_text: str) -> DeviceProfile:
                 preset_dp=entry.get("preset_dp"),
                 preset_map=entry.get("preset_map"),
                 humidity_dp=entry.get("humidity_dp"),
+                swing_dp=entry.get("swing_dp"),
+                swing_map=entry.get("swing_map"),
                 icon=entry.get("icon"),
             )
         )
@@ -392,6 +402,8 @@ def profile_to_yaml(profile: DeviceProfile) -> str:
                     "preset_dp": cm.preset_dp,
                     "preset_map": cm.preset_map,
                     "humidity_dp": cm.humidity_dp,
+                    "swing_dp": cm.swing_dp,
+                    "swing_map": cm.swing_map,
                     "icon": cm.icon,
                 }.items()
                 if v is not None

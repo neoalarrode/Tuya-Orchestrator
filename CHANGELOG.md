@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2.3 - fix: LAN status query crashed every device, plus sharper AC warning
+
+Two more issues from the first real end-to-end pairing attempt (an
+"arenero"/litter box, first device to ever actually reach the LAN status
+call in this project):
+
+- **Critical, blocked every device**: `TuyaLocalDevice.status()` pre-built
+  its payload into bytes via `_build_payload()`, then passed those bytes
+  into `_send_receive()`, which calls `_build_payload()` on it AGAIN
+  internally (it expects a plain dict, exactly like `set_dps()` already
+  correctly passes). `json.dumps()` on an already-bytes object raised
+  `TypeError: Object of type bytes is not JSON serializable`, surfaced to
+  the user as "Could not reach device on LAN: ...". This hit the coordinator's
+  very first refresh for EVERY device, not just this one - no device could
+  ever have connected until this was fixed. Verified with a direct
+  payload-building test (bypassing the real socket) that the path no
+  longer raises.
+- The AC's implausible `target_temp_max: 88.0` (known Tuya cloud metadata
+  bug, see v0.2.0/README) was still slipping past unnoticed in the
+  auto-generated YAML - the generic boilerplate warning at the top wasn't
+  enough for the user to catch it before saving. `build_profile_from_schema`
+  now returns `(profile, warnings)`; a climate setpoint max above a sane
+  50°C ceiling gets a warning naming the exact field/DP/value, prepended
+  right above the generated YAML instead of buried in generic text. Still
+  never auto-corrects the number - only makes it impossible to miss.
+- **Same AC report also flagged missing functions** (fan speed, and
+  everything else beyond the 6 basic DPs): root cause was
+  `get_device_schema()` only falling back to the v2.0 endpoint when v1.1
+  failed outright - but v1.1 "succeeded" for this AC with a genuinely
+  PARTIAL schema (6 of the device's real ~30 DPs), so v2.0 was never even
+  tried. Fixed to always query and merge BOTH endpoints (v1.1 wins on a
+  genuine dp_id conflict, v2.0 fills the rest) - verified live: the same
+  AC now returns all 30 DPs. `ClimateMapping` gained `swing_dp`/`swing_map`
+  to go with the already-existing `fan_dp`/`preset_dp` (reused from the
+  heater's High/Low work) - fan speed (`windspeed`), sleep mode (`sleep`,
+  as a preset), and swing (`up_down_sweep`) are now auto-detected straight
+  into the climate entity itself, not left as disconnected loose entities.
+  Everything else the AC exposes (energy counters, air quality, dirty
+  filter, the second swing axis...) now correctly shows up as generic
+  auto-typed sensor/select/number/switch entities instead of silently
+  vanishing when v1.1's partial response was all that got read.
+
 ## v0.2.2 - fix: encrypted broadcast (port 6667) decryption was completely broken
 
 Found by diffing against localtuya's actual `discovery.py` (`master`

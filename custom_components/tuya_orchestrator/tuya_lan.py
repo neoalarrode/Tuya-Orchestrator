@@ -112,8 +112,18 @@ class TuyaLocalDevice:
     # -- public API -------------------------------------------------------------
     async def status(self) -> dict[int, Any]:
         """Query current DP values."""
-        msg = self._build_payload({"gwId": self.device_id, "devId": self.device_id})
-        reply = await self._send_receive(CMD_STATUS, msg)
+        # BUG FIXED HERE: this used to pre-encode the payload via
+        # _build_payload() (-> bytes) and pass THAT as `obj` into
+        # _send_receive(), which itself calls _build_payload(obj) again
+        # internally (it expects a plain dict, same as set_dps() already
+        # correctly passes one). json.dumps() on an already-bytes object
+        # raised "Object of type bytes is not JSON serializable" - this hit
+        # every device's very first status refresh
+        # (coordinator.async_config_entry_first_refresh()), so no device
+        # could ever actually connect. First real live-LAN report caught
+        # this; set_dps() never had the bug, only status() did.
+        obj = {"gwId": self.device_id, "devId": self.device_id}
+        reply = await self._send_receive(CMD_STATUS, obj)
         return _extract_dps(reply)
 
     async def set_dps(self, dps: dict[int, Any]) -> dict[int, Any]:

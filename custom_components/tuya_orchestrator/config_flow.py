@@ -194,21 +194,24 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return
         try:
             schema = await self._cloud_api.get_device_schema(self._chosen_device["device_id"])
-            profile = build_profile_from_schema(
+            profile, warnings = build_profile_from_schema(
                 name=self._chosen_device["name"],
                 category=self._chosen_device.get("category"),
                 product_id=self._chosen_device.get("product_id"),
                 schema=schema,
             )
             if profile.dps or profile.lights or profile.climates or profile.vacuums:
-                header = (
-                    "# Auto-generated from this device's real Tuya Cloud DP schema.\n"
-                    "# Review before saving - Tuya's own cloud metadata is sometimes\n"
-                    "# wrong (a real example found during development: an AC's declared\n"
-                    "# max temperature was 88 degC, copy-pasted from its Fahrenheit DP's\n"
-                    "# range). Numeric min/max/step and enum labels below are taken\n"
-                    "# as-is from the cloud; fix anything that looks implausible.\n"
-                )
+                header_lines = [
+                    "# Auto-generated from this device's real Tuya Cloud DP schema.",
+                    "# Review before saving - numeric min/max/step and enum labels are",
+                    "# taken as-is from the cloud, which is not always right.",
+                ]
+                if warnings:
+                    header_lines.append("#")
+                    header_lines.append("# SPECIFIC ISSUES FOUND IN THIS DEVICE'S DATA - fix before saving:")
+                    for w in warnings:
+                        header_lines.append(f"#  - {w}")
+                header = "\n".join(header_lines) + "\n"
                 self._auto_profile_yaml = header + profile_to_yaml(profile)
         except Exception as err:  # noqa: BLE001 - best-effort, never block onboarding
             _LOGGER.warning("Auto-profile generation failed for %s: %s", self._chosen_device["device_id"], err)

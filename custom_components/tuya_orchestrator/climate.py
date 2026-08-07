@@ -62,6 +62,8 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
             features |= ClimateEntityFeature.FAN_MODE
         if mapping.preset_dp is not None:
             features |= ClimateEntityFeature.PRESET_MODE
+        if mapping.swing_dp is not None:
+            features |= ClimateEntityFeature.SWING_MODE
         features |= ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
         self._attr_supported_features = features
 
@@ -80,6 +82,8 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
             self._attr_fan_modes = list(mapping.fan_map.values())
         if mapping.preset_dp is not None and mapping.preset_map:
             self._attr_preset_modes = list(mapping.preset_map.values())
+        if mapping.swing_dp is not None and mapping.swing_map:
+            self._attr_swing_modes = list(mapping.swing_map.values())
 
         self._attr_min_temp = mapping.target_temp_min
         self._attr_max_temp = mapping.target_temp_max
@@ -140,6 +144,13 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
             return None
         return m.preset_map.get(self._data.get(m.preset_dp))
 
+    @property
+    def swing_mode(self) -> str | None:
+        m = self._mapping
+        if m.swing_dp is None or not m.swing_map:
+            return None
+        return m.swing_map.get(self._data.get(m.swing_dp))
+
     async def _send(self, dps: dict[int, Any]) -> None:
         await self.coordinator.device.set_dps(dps)
         merged = dict(self.coordinator.data or {})
@@ -184,6 +195,14 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
         reverse = {v: k for k, v in m.preset_map.items()}
         if (raw := reverse.get(preset_mode)) is not None:
             await self._send({m.preset_dp: raw})
+
+    async def async_set_swing_mode(self, swing_mode: str) -> None:
+        m = self._mapping
+        if m.swing_dp is None or not m.swing_map:
+            return
+        reverse = {v: k for k, v in m.swing_map.items()}
+        if (raw := reverse.get(swing_mode)) is not None:
+            await self._send({m.swing_dp: raw})
 
     async def async_turn_on(self) -> None:
         if self._mapping.switch_dp is not None:

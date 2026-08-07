@@ -113,27 +113,45 @@ class TuyaCloudApi:
 
     async def get_device_schema(self, device_id: str) -> list[dict[str, Any]]:
         """Return this device's real DP schema, normalized to a common
-        shape regardless of which cloud endpoint actually had it:
+        shape regardless of which cloud endpoint(s) actually had it:
 
             {"code": str, "dp_id": int, "type": "bool"|"value"|"enum"|
              "bitmap"|"string"|"json"|"raw", "access": "rw"|"ro"|"wr",
              "values": dict}   # unit/min/max/scale/step or range, as given
 
-        Tries the standard v1.1 "specification" endpoint first; some
-        (mostly legacy) products don't publish anything there - confirmed
-        against real devices where it returns errors on `specification`,
-        `functions` AND `status` alike - but DO expose their schema via the
-        newer v2.0 "Thing Data Model" endpoint instead, so that's the
-        fallback rather than giving up.
+        ALWAYS queries both the standard v1.1 "specification" endpoint AND
+        the newer v2.0 "Thing Data Model" endpoint and merges them by
+        dp_id (v1.1 wins on a genuine conflict, v2.0 fills in whatever
+        v1.1 didn't have) - fixed after a real report: v1.1 can return
+        `success: true` with a genuinely PARTIAL schema (observed on a
+        real AC - v1.1 gave only 6 DPs, missing fan speed/sleep mode/swing/
+        air quality/... entirely, while v2.0 for the SAME device had ~25).
+        `success` was never a completeness guarantee; only trying v2.0 as
+        a fallback-on-error (the previous behavior) silently missed
+        real functionality whenever v1.1 "succeeded" but was incomplete -
+        which is apparently not a rare edge case. Only raises if BOTH
+        endpoints fail outright.
         """
+        entries_by_dp: dict[int, dict[str, Any]] = {}
+        errors: list[Exception] = []
+
         try:
             result = await self._request("GET", f"/v1.1/devices/{device_id}/specifications")
-            return _normalize_v11_schema(result)
-        except TuyaCloudApiError:
-            pass
+            for e in _normalize_v11_schema(result):
+                entries_by_dp[e["dp_id"]] = e
+        except TuyaCloudApiError as err:
+            errors.append(err)
 
-        result = await self._request("GET", f"/v2.0/cloud/thing/{device_id}/model")
-        return _normalize_v20_schema(result)
+        try:
+            result = await self._request("GET", f"/v2.0/cloud/thing/{device_id}/model")
+            for e in _normalize_v20_schema(result):
+                entries_by_dp.setdefault(e["dp_id"], e)
+        except TuyaCloudApiError as err:
+            errors.append(err)
+
+        if not entries_by_dp and errors:
+            raise errors[0]
+        return list(entries_by_dp.values())
 
 
 def _normalize_v11_schema(result: dict[str, Any]) -> list[dict[str, Any]]:
