@@ -40,6 +40,7 @@ from .const import (
     CONF_UID,
     DEFAULT_PROTOCOL_VERSION,
     DEFAULT_SCAN_INTERVAL,
+    DISCOVERY_DATA_KEY,
     DOMAIN,
     ENTRY_TYPE_ACCOUNT,
     ENTRY_TYPE_DEVICE,
@@ -140,9 +141,14 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         version = discovery_info.get("version")
         if self._chosen_ip is None:
-            # Not seen in the account poller's last LAN pass - try once more,
-            # right now, before giving up and asking the user for a static IP.
-            found = (await discover_devices()).get(device_id)
+            # Not seen in the account poller's last LAN pass - check the
+            # always-on PersistentDiscovery cache first (instant, no extra
+            # listening needed), then fall back to a short fresh listen
+            # before giving up and asking the user for a static IP.
+            persistent = self.hass.data.get(DOMAIN, {}).get(DISCOVERY_DATA_KEY)
+            found = persistent.devices.get(device_id) if persistent else None
+            if found is None:
+                found = (await discover_devices()).get(device_id)
             self._chosen_ip = found.ip if found else None
             version = found.version if found else version
         if version and version not in ("3.1", "3.3"):

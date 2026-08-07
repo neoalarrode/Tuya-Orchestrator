@@ -23,6 +23,12 @@ ENTRY_TYPE_ACCOUNT = "account"
 ENTRY_TYPE_DEVICE = "device"
 CONF_ACCOUNT_ENTRY_ID = "account_entry_id"  # stashed on discovery_info to trace back to its account
 
+# hass.data[DOMAIN][DISCOVERY_DATA_KEY] holds the single, domain-wide
+# PersistentDiscovery instance started once in async_setup() - see
+# __init__.py/discovery.py. Not an entry_id (those are HA-generated UUIDs),
+# so no collision with the per-entry storage that also lives under DOMAIN.
+DISCOVERY_DATA_KEY = "_persistent_discovery"
+
 # Cloud linking (used only during config_flow to fetch local_keys; never
 # stored/used again after setup - the running integration is 100% LAN).
 CONF_REGION = "region"

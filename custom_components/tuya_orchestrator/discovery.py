@@ -147,11 +147,8 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
         )
 
 
-async def discover_devices(timeout: float = DISCOVERY_TIMEOUT) -> dict[str, DiscoveredDevice]:
-    """Listen on all three broadcast ports for `timeout` seconds, return devices found."""
+async def _bind_all_ports(results: dict[str, DiscoveredDevice]) -> list:
     loop = asyncio.get_event_loop()
-    results: dict[str, DiscoveredDevice] = {}
-
     transports = []
     for port in (UDP_PORT_UNENCRYPTED, UDP_PORT_ENCRYPTED, UDP_PORT_APP):
         try:
@@ -175,11 +172,55 @@ async def discover_devices(timeout: float = DISCOVERY_TIMEOUT) -> dict[str, Disc
             "Discovery could not bind ANY UDP port (6666/6667/7000) - devices will "
             "never be found this way; use manual IP entry instead"
         )
+    return transports
 
+
+class PersistentDiscovery:
+    """Long-lived broadcast listener, kept open for the WHOLE Home Assistant
+    session (started once in async_setup(), closed on HA shutdown) - not a
+    short listen-and-close window.
+
+    Real gap fixed here, found reviewing localtuya's __init__.py end to end
+    after the ported/generalized discovery.py fixes (v0.2.2/v0.2.9) alone
+    didn't resolve a live "still not discovering" report: localtuya starts
+    exactly ONE persistent `TuyaDiscovery` listener at integration setup and
+    keeps it running for the entire HA runtime, continuously accumulating
+    whatever it hears into a live cache - it does NOT open a fresh listener
+    for a few seconds each time it needs an answer, the way this module's
+    `discover_devices()` (an on-demand, `DISCOVERY_TIMEOUT`-second window)
+    did until now. A device that broadcasts on a longer or irregular
+    interval - or just doesn't happen to transmit inside whatever few-second
+    window a particular poll opened - could be missed by every single
+    scheduled poll indefinitely, with correct decoding but simply never
+    listening at the right moment. A listener open ~100% of the time doesn't
+    have that problem. `account.py`'s poller now reads from this instead of
+    calling `discover_devices()` fresh each cycle.
+    """
+
+    def __init__(self) -> None:
+        self.devices: dict[str, DiscoveredDevice] = {}
+        self._transports: list = []
+
+    async def start(self) -> None:
+        self._transports = await _bind_all_ports(self.devices)
+
+    def close(self) -> None:
+        for t in self._transports:
+            t.close()
+        self._transports = []
+
+
+async def discover_devices(timeout: float = DISCOVERY_TIMEOUT) -> dict[str, DiscoveredDevice]:
+    """One-shot, short-window listen - kept as a fallback for contexts
+    without a running `PersistentDiscovery` (shouldn't normally happen once
+    `async_setup()` has run, see that function in __init__.py) and for
+    forcing an extra immediate check on top of whatever the persistent
+    listener has already accumulated."""
+    results: dict[str, DiscoveredDevice] = {}
+    transports = await _bind_all_ports(results)
     try:
         await asyncio.sleep(timeout)
     finally:
         for t in transports:
             t.close()
-
     return results

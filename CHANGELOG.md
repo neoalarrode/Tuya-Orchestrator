@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.3.0 - persistent discovery listener (architectural fix, not another protocol bug)
+
+Requested explicitly ("revisa el código entero de localtuya") after
+v0.2.9's port/framing fixes still didn't resolve a live "not discovering"
+report. Reviewing localtuya's `__init__.py` end to end (not just
+`discovery.py`, which had already been diffed twice) found the real gap:
+**localtuya starts exactly ONE persistent broadcast listener at
+integration setup and keeps it open for the entire HA session**,
+continuously accumulating whatever it hears into a live cache - it does
+NOT open a fresh listener for a few seconds each time it needs an answer.
+
+This integration's `discover_devices()` did the opposite: an ephemeral
+`DISCOVERY_TIMEOUT` (8s) listen-and-close window, invoked fresh on every
+5-minute poll. A device broadcasting on a longer or irregular interval -
+or one that simply doesn't happen to transmit inside whichever few-second
+window a particular poll opened - could be missed by every single
+scheduled poll indefinitely, with completely correct decoding but simply
+never listening at the right moment. This was a real, independent gap
+from the protocol-level bugs fixed in v0.2.2-v0.2.9 (all real, none of
+them sufficient on their own).
+
+Fixed to match localtuya's architecture:
+
+- New `discovery.PersistentDiscovery`: binds all three ports once, keeps
+  the sockets open, and accumulates every device it ever hears into a
+  live `devices` dict - never closed until Home Assistant itself shuts
+  down.
+- New `async_setup()` in `__init__.py` - called ONCE per HA startup,
+  before any ConfigEntry - starts this listener and stores it at
+  `hass.data[DOMAIN][DISCOVERY_DATA_KEY]`, closing it on
+  `EVENT_HOMEASSISTANT_STOP` (mirrors localtuya's own shutdown handling).
+- `account.py`'s poller now reads directly from this always-on cache
+  instead of opening a fresh short-window listener every cycle.
+- `config_flow.py`'s per-device fallback (when a discovered device's IP
+  wasn't in the poller's last snapshot) now checks this same cache first
+  - instant, no extra listening - before falling back to a one-off short
+  listen as a last resort.
+- The original `discover_devices()` one-shot function is kept only as a
+  defensive fallback for the (shouldn't-normally-happen) case where the
+  persistent listener isn't present.
+
+Verified with a direct test: bind all 3 ports, simulate a real broadcast
+packet arriving on the running listener, confirm it lands in the live
+cache, then close cleanly.
+
 ## v0.2.9 - fix: missing third discovery port (7000), only listened on 2 of 3
 
 The user's own insight ("antes hablaba con dispositivos... hay dos partes

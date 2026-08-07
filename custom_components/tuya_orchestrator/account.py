@@ -18,6 +18,14 @@ HomeKit/Tapo-style discovery actually means; a device merely existing on
 the Tuya account isn't the same claim. Such a device can still be added
 via the "manual" (no-cloud) flow with a hand-entered IP.
 
+"Seen on this LAN" is judged against `discovery.PersistentDiscovery`'s
+continuously-accumulating cache (started once at HA startup, see
+__init__.py's `async_setup()`), NOT a fresh few-second listen per poll -
+see that class's docstring for why a short on-demand window isn't
+reliable enough (a real gap found reviewing localtuya's own __init__.py
+end to end after the protocol/port fixes alone didn't resolve a live
+report).
+
 Dedup relies on `ConfigFlow.async_set_unique_id()`'s own built-in
 behavior: calling it a second time for a still-in-progress flow with the
 same unique_id aborts as "already_in_progress" automatically, so polling
@@ -41,6 +49,7 @@ from .const import (
     CONF_ACCOUNT_ENTRY_ID,
     CONF_REGION,
     CONF_UID,
+    DISCOVERY_DATA_KEY,
     DISCOVERY_POLL_INTERVAL,
     DOMAIN,
 )
@@ -64,7 +73,15 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
             _LOGGER.warning("Tuya Cloud poll failed for account %s: %s", entry.title, err)
             return
 
-        lan = await discover_devices()
+        # Read from the domain-wide PersistentDiscovery listener (running
+        # continuously since async_setup(), see __init__.py) instead of
+        # opening a fresh short-window listener every poll - a device that
+        # broadcasts on a longer/irregular interval could be missed by any
+        # given few-second window, but not by something that's always
+        # listening. Falls back to a one-off short listen only if that
+        # listener somehow isn't there (shouldn't normally happen).
+        persistent = hass.data.get(DOMAIN, {}).get(DISCOVERY_DATA_KEY)
+        lan = dict(persistent.devices) if persistent else await discover_devices()
         configured_ids = {e.unique_id for e in hass.config_entries.async_entries(DOMAIN) if e.unique_id}
         _LOGGER.debug(
             "Tuya account %s: %s device(s) on cloud, %s seen on LAN broadcast (%s), "

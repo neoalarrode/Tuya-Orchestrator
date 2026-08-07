@@ -14,7 +14,9 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.typing import ConfigType
 
 from .account import async_setup_account
 from .const import (
@@ -25,15 +27,38 @@ from .const import (
     CONF_PROTOCOL_VERSION,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    DISCOVERY_DATA_KEY,
     DOMAIN,
     ENTRY_TYPE_ACCOUNT,
     PLATFORMS,
 )
 from .coordinator import TuyaOrchestratorCoordinator
+from .discovery import PersistentDiscovery
 from .profile import parse_profile
 from .tuya_lan import TuyaLocalDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Called ONCE per HA startup, before any ConfigEntry is set up -
+    starts the LAN broadcast listener here so it stays open and
+    accumulating for the WHOLE session, matching localtuya's own
+    `__init__.py` (its `TuyaDiscovery` is started exactly this way, not
+    per-poll). See `discovery.PersistentDiscovery`'s docstring for why an
+    ephemeral few-second listen-and-close window per poll wasn't reliable
+    enough - found by reviewing localtuya's full codebase after a live
+    report that devices confirmed present on the LAN still weren't being
+    discovered even after v0.2.9's port/framing fixes."""
+    listener = PersistentDiscovery()
+    await listener.start()
+    hass.data.setdefault(DOMAIN, {})[DISCOVERY_DATA_KEY] = listener
+
+    def _on_stop(event) -> None:
+        listener.close()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
