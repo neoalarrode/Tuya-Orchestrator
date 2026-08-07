@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.2.5 - fix: heat_cool setpoint invisible, coordinator wiping known DP values
+
+Two more from live testing on the AC:
+
+- **"No puedo setear la temperatura" - HA requires `target_temperature_low`/
+  `target_temperature_high` (and `ClimateEntityFeature.TARGET_TEMPERATURE_RANGE`)
+  instead of a plain `target_temperature` whenever the entity's current
+  `hvac_mode` is `HEAT_COOL`** (this AC's "Auto" mode, since `auto` maps to
+  `heat_cool` per the Matter-standard convention this project already
+  follows). Only declaring plain `TARGET_TEMPERATURE` meant the setpoint
+  control didn't render/work at all while in Auto - same real HA
+  requirement already solved in Climate Orchestrator's dual-setpoint
+  zones, applied here. Since this device has only ONE physical setpoint
+  DP regardless of mode, both `target_temperature_low`/`_high` mirror the
+  same value/DP - an honest simplification (documented in code), not a
+  real independent range.
+- **"No se consultan los valores actuales" - `_async_update_data()` was
+  REPLACING `self.data` wholesale with each poll's `status()` result.**
+  Real Tuya devices aren't guaranteed to include every DP in every
+  DP_QUERY reply (some report a subset, or an initial near-empty ack
+  before real values arrive as separate push frames). Every periodic poll
+  could silently wipe out previously-known DP values the fresh reply
+  didn't happen to repeat. Now merges onto existing data instead of
+  replacing, exactly like the push-handler path already (correctly) did -
+  plus added debug logging of each raw DP_QUERY reply for future
+  diagnosis without guessing.
+
 ## v0.2.4 - fix: "Connection lost" on real device, missing 3.3 control header, duplicate °F control
 
 From an AC pairing attempt: "Could not reach device on LAN: Connection

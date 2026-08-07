@@ -58,6 +58,17 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
         features = ClimateEntityFeature(0)
         if mapping.target_temp_dp is not None:
             features |= ClimateEntityFeature.TARGET_TEMPERATURE
+            # HA REQUIRES target_temperature_low/high (not plain
+            # target_temperature) whenever the entity can be in
+            # HVACMode.HEAT_COOL - without this the temperature control
+            # simply doesn't render/work while in that mode (confirmed:
+            # same real HA requirement already handled in Climate
+            # Orchestrator's dual-setpoint zones). This device only has
+            # ONE physical setpoint DP regardless of mode, so both bounds
+            # mirror the same value/DP - not a real independent range, but
+            # the only honest option without a second DP to back it.
+            if mapping.mode_dp is not None and mapping.mode_map and "heat_cool" in mapping.mode_map.values():
+                features |= ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
         if mapping.fan_dp is not None:
             features |= ClimateEntityFeature.FAN_MODE
         if mapping.preset_dp is not None:
@@ -122,6 +133,22 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
 
     @property
     def target_temperature(self) -> float | None:
+        # Not meaningful in HEAT_COOL mode - HA expects target_temperature_low/
+        # high there instead (see __init__'s comment on TARGET_TEMPERATURE_RANGE).
+        if self.hvac_mode == HVACMode.HEAT_COOL:
+            return None
+        return self._decode_scaled(self._mapping.target_temp_dp, self._mapping.target_temp_scale)
+
+    @property
+    def target_temperature_low(self) -> float | None:
+        if self.hvac_mode != HVACMode.HEAT_COOL:
+            return None
+        return self._decode_scaled(self._mapping.target_temp_dp, self._mapping.target_temp_scale)
+
+    @property
+    def target_temperature_high(self) -> float | None:
+        if self.hvac_mode != HVACMode.HEAT_COOL:
+            return None
         return self._decode_scaled(self._mapping.target_temp_dp, self._mapping.target_temp_scale)
 
     @property
@@ -175,7 +202,24 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
             await self._send(dps)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        if (temp := kwargs.get("temperature")) is None or self._mapping.target_temp_dp is None:
+        if self._mapping.target_temp_dp is None:
+            return
+        # In HEAT_COOL mode HA's climate.set_temperature service sends
+        # target_temp_low/target_temp_high (HA's actual service parameter
+        # names - note: no "erature", unlike the target_temperature_low/
+        # high PROPERTY names) instead of a plain temperature. Both map to
+        # the SAME single physical DP here (see the property getters
+        # above), so either one (or their average if both arrive in the
+        # same call) is written.
+        temp = kwargs.get("temperature")
+        low = kwargs.get("target_temp_low")
+        high = kwargs.get("target_temp_high")
+        if temp is None:
+            if low is not None and high is not None:
+                temp = (low + high) / 2
+            else:
+                temp = low if low is not None else high
+        if temp is None:
             return
         raw = self._encode_scaled(temp, self._mapping.target_temp_scale)
         await self._send({self._mapping.target_temp_dp: raw})

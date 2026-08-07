@@ -48,10 +48,24 @@ class TuyaOrchestratorCoordinator(DataUpdateCoordinator[dict[int, Any]]):
         self.async_set_updated_data(merged)
 
     async def _async_update_data(self) -> dict[int, Any]:
+        # BUG FIXED HERE: this used to `return` the raw status() result
+        # directly, which DataUpdateCoordinator uses to REPLACE self.data
+        # wholesale - but a real Tuya device's DP_QUERY reply is not
+        # guaranteed to include every DP every time (some report only a
+        # subset, or an initial near-empty ack before the real values
+        # arrive as separate push frames handled by _handle_push above).
+        # Every periodic poll could silently wipe out previously-known DP
+        # values the fresh reply simply didn't repeat - matching a live
+        # report of entities never showing a current value. Merge instead,
+        # exactly like _handle_push already (correctly) does for pushes.
         try:
-            return await self.device.status()
+            fresh = await self.device.status()
         except Exception as err:  # noqa: BLE001
             raise UpdateFailed(f"Could not reach device on LAN: {err}") from err
+        _LOGGER.debug("%s: DP_QUERY returned %s", self.device.device_id, fresh)
+        merged = dict(self.data or {})
+        merged.update(fresh)
+        return merged
 
     async def async_set_dp(self, dp_id: int, raw_value: Any) -> None:
         await self.device.set_dps({dp_id: raw_value})
