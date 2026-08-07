@@ -32,6 +32,15 @@ same unique_id aborts as "already_in_progress" automatically, so polling
 every 5 minutes does not spam duplicate discovery cards for a device the
 user hasn't acted on yet. The `configured_ids` check below is a cheap
 pre-filter for devices that already have a real (or ignored) ConfigEntry.
+
+**Also runs an active-scan fallback** (`active_scan.py`, `_active_scan_poll`,
+every `ACTIVE_SCAN_INTERVAL`) for cloud-known devices passive discovery
+still hasn't found after a while - real gap found from a live report that
+specific device categories (relay-based heaters, an irrigation valve)
+never got discovered even with the persistent listener (v0.3.0) running:
+some simple/cheap devices only broadcast briefly around boot and then go
+quiet, which no amount of passive listening will ever catch. Brute-forces
+the local /24 for the LAN control port instead.
 """
 from __future__ import annotations
 
@@ -43,7 +52,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 
+from .active_scan import active_scan
 from .const import (
+    ACTIVE_SCAN_INTERVAL,
     CONF_ACCESS_ID,
     CONF_ACCESS_SECRET,
     CONF_ACCOUNT_ENTRY_ID,
@@ -65,10 +76,22 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
         session, entry.data[CONF_REGION], entry.data[CONF_ACCESS_ID], entry.data[CONF_ACCESS_SECRET]
     )
 
+    async def _offer(device: dict, ip: str, version: str | None) -> None:
+        await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_INTEGRATION_DISCOVERY},
+            data={**device, "ip": ip, "version": version, CONF_ACCOUNT_ENTRY_ID: entry.entry_id},
+        )
+
+    async def _cloud_devices_and_configured_ids() -> tuple[list[dict], set[str]]:
+        devices = await api.get_user_devices(entry.data[CONF_UID])
+        configured_ids = {e.unique_id for e in hass.config_entries.async_entries(DOMAIN) if e.unique_id}
+        return devices, configured_ids
+
     async def _poll(now=None) -> None:
         try:
             await api.validate()
-            devices = await api.get_user_devices(entry.data[CONF_UID])
+            devices, configured_ids = await _cloud_devices_and_configured_ids()
         except (TuyaCloudAuthError, TuyaCloudApiError) as err:
             _LOGGER.warning("Tuya Cloud poll failed for account %s: %s", entry.title, err)
             return
@@ -82,7 +105,6 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
         # listener somehow isn't there (shouldn't normally happen).
         persistent = hass.data.get(DOMAIN, {}).get(DISCOVERY_DATA_KEY)
         lan = dict(persistent.devices) if persistent else await discover_devices()
-        configured_ids = {e.unique_id for e in hass.config_entries.async_entries(DOMAIN) if e.unique_id}
         _LOGGER.debug(
             "Tuya account %s: %s device(s) on cloud, %s seen on LAN broadcast (%s), "
             "%s already configured/ignored (%s)",
@@ -108,21 +130,52 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
                     device_id,
                 )
                 continue
-            await hass.config_entries.flow.async_init(
-                DOMAIN,
-                context={"source": SOURCE_INTEGRATION_DISCOVERY},
-                data={
-                    **device,
-                    "ip": found.ip,
-                    "version": found.version,
-                    CONF_ACCOUNT_ENTRY_ID: entry.entry_id,
-                },
-            )
+            await _offer(device, found.ip, found.version)
             new_count += 1
         if new_count:
             _LOGGER.info("Tuya account %s: %s new device(s) offered for discovery", entry.title, new_count)
 
+    async def _active_scan_poll(now=None) -> None:
+        """Brute-force fallback (active_scan.py) for devices that STILL
+        haven't been found via passive broadcast after a while - some
+        simple/cheap devices (relay-based heaters, irrigation valves) only
+        broadcast briefly around boot and then go quiet, which no amount
+        of passive listening will ever catch. Runs far less often than
+        `_poll` (ACTIVE_SCAN_INTERVAL, 30 min) since a full subnet sweep is
+        real network noise and takes real wall-clock time."""
+        try:
+            await api.validate()
+            devices, configured_ids = await _cloud_devices_and_configured_ids()
+        except (TuyaCloudAuthError, TuyaCloudApiError) as err:
+            _LOGGER.warning("Tuya Cloud poll failed for account %s (active scan): %s", entry.title, err)
+            return
+
+        missing = [d for d in devices if d["device_id"] not in configured_ids and d.get("local_key")]
+        if not missing:
+            return
+        _LOGGER.debug(
+            "Tuya account %s: active-scanning LAN for %d device(s) not yet found passively: %s",
+            entry.title,
+            len(missing),
+            [d["name"] for d in missing],
+        )
+        matches = await active_scan(hass, [{"device_id": d["device_id"], "local_key": d["local_key"]} for d in missing])
+        if not matches:
+            return
+        by_id = {d["device_id"]: d for d in missing}
+        for device_id, ip in matches.items():
+            await _offer(by_id[device_id], ip, "3.3")  # identified via a 3.3-protocol probe, see active_scan.py
+        _LOGGER.info(
+            "Tuya account %s: active scan found %d device(s) passive discovery missed: %s",
+            entry.title,
+            len(matches),
+            list(matches),
+        )
+
     unsub = async_track_time_interval(hass, _poll, timedelta(seconds=DISCOVERY_POLL_INTERVAL))
     entry.async_on_unload(unsub)
+    unsub_scan = async_track_time_interval(hass, _active_scan_poll, timedelta(seconds=ACTIVE_SCAN_INTERVAL))
+    entry.async_on_unload(unsub_scan)
     # First pass shortly after startup - don't block entry setup on it.
     hass.async_create_task(_poll())
+    hass.async_create_task(_active_scan_poll())

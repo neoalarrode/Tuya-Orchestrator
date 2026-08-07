@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.4.0 - active LAN scan fallback (for devices that don't broadcast)
+
+Requested after confirming specific device categories (relay-based
+heaters, an irrigation valve) still weren't discovered even with the
+persistent passive listener (v0.3.0) running correctly. Real, structural
+gap distinct from every protocol bug fixed so far: **some simple/cheap
+Tuya devices only broadcast for a short window right after boot/network
+join and then go quiet**, relying on the controlling app to have cached
+their IP - unlike something continuously-reporting like an AC. No amount
+of passive listening, however correct, finds a device that has simply
+stopped announcing itself. Confirmed the cloud API's own `ip` field is
+NOT useful here either - it's the device's public/WAN IP as seen by
+Tuya's servers (the home router's internet-facing address, same for every
+device behind it), not its LAN-local IP; the cloud has no visibility into
+private LAN topology at all.
+
+New `active_scan.py`, mirroring tinytuya's own brute-force fallback:
+
+1. Fast sweep: try opening a TCP connection to port 6668 (the LAN control
+   port) against every host in the local /24 - most hosts have nothing
+   listening there, so this narrows candidates down cheaply and quickly.
+2. For each host that DID have the port open, try to positively identify
+   it: a real connect + `status()` attempt using each not-yet-found cloud
+   device's own device_id/local_key in turn. Wrong key/host fails to
+   decrypt into valid DPS JSON (caught, not a match); the right one
+   succeeds - strong enough evidence without brute-forcing the actual
+   16-byte key space.
+
+Wired into `account.py` as a separate, much less frequent task
+(`ACTIVE_SCAN_INTERVAL`, 30 min - vs. the passive poll's 5 min) since a
+full subnet sweep is real network noise and takes real wall-clock time,
+unlike reading the always-on passive cache. Runs once at startup too (not
+just on its own timer) so a reload gives faster feedback while testing.
+A match found this way gets offered as a normal "Discovered" card exactly
+like a passive find, just with `version` assumed "3.3" (identified via a
+3.3-protocol probe).
+
+Local subnet is guessed from Home Assistant's own outbound-routing IP
+(no packets actually sent, the standard UDP-connect trick) assuming a
+/24 - correct for the overwhelming majority of home networks; a
+non-standard subnet size isn't detected.
+
+Caught and fixed a real bug in this new code during testing: `except
+TimeoutError` doesn't catch `asyncio.TimeoutError` on Python <3.11 (they
+are distinct classes before that version) - fixed to catch
+`asyncio.TimeoutError` explicitly. Verified all three pieces directly: IP
+guessing, TCP port-open detection (both true and false cases against a
+real local test server), and the subnet sweep itself.
+
 ## v0.3.2 - fix: CONTROL command sent an extra, unexpected field
 
 Continued review ("sigue revisando") of `common.py` and `_generate_payload`'s

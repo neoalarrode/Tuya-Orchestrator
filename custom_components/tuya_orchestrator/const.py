@@ -76,6 +76,11 @@ UDP_PORT_APP = 7000  # "Tuya app" broadcast port - missing entirely until a
 UDP_KEY_SEED = b"yGAdlopoPVldABfn"  # MD5 of this is the real AES key - see discovery.py
 DISCOVERY_TIMEOUT = 8
 DISCOVERY_POLL_INTERVAL = 300  # seconds; how often an "account" entry re-scans for new devices
+ACTIVE_SCAN_INTERVAL = 1800  # seconds; how often to brute-force-scan the LAN for devices
+# passive broadcast discovery still hasn't found (see active_scan.py) - much
+# less frequent than DISCOVERY_POLL_INTERVAL since a full subnet sweep is
+# real network noise and takes real wall-clock time, unlike reading the
+# always-on passive listener's cache.
 
 # ---------------------------------------------------------------------------
 # Profile / entity mapping
