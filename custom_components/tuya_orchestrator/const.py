@@ -63,6 +63,10 @@ TUYA_REGIONS = {
 # ---------------------------------------------------------------------------
 UDP_PORT_UNENCRYPTED = 6666
 UDP_PORT_ENCRYPTED = 6667
+UDP_PORT_APP = 7000  # "Tuya app" broadcast port - missing entirely until a
+# real report ("solo implementaste una parte del protocolo") pointed at it;
+# confirmed against tinytuya's scanner.py (UDPPORTAPP = 7000). Newer/app-
+# paired devices commonly broadcast here instead of (or as well as) 6666/6667.
 UDP_KEY_SEED = b"yGAdlopoPVldABfn"  # MD5 of this is the real AES key - see discovery.py
 DISCOVERY_TIMEOUT = 8
 DISCOVERY_POLL_INTERVAL = 300  # seconds; how often an "account" entry re-scans for new devices

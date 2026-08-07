@@ -1,52 +1,74 @@
 """UDP broadcast discovery for Tuya LAN devices.
 
 Tuya devices periodically broadcast their presence (gwId + ip + product
-key + protocol version) on two fixed UDP ports:
+key + protocol version) on THREE fixed UDP ports:
 
-- 6666: unencrypted, plain JSON.
+- 6666: unencrypted, plain JSON (protocol 3.1 era).
 - 6667: encrypted with a fixed, publicly-documented key, same AES-ECB
-  scheme as the LAN control protocol.
+  scheme as the LAN control protocol (protocol 3.3 era).
+- 7000: "Tuya app" broadcast port - found missing entirely after a real
+  report ("dejaron de ofrecerse... hay dos partes del protocolo, solo
+  implementaste uno"), confirmed against tinytuya's scanner.py
+  (`UDPPORTAPP = 7000`) which listens on all three. Newer/app-paired
+  devices commonly broadcast here.
 
 This lets us resolve "device_id -> current LAN IP" without the user typing
 IPs by hand, and re-resolve automatically if a device's DHCP lease changes.
 
-Cross-checked directly against localtuya's real implementation
-(custom_components/localtuya/discovery.py, `master` branch) after a report
-that discovery never found a device even once the port-bind conflict
-(v0.1.1) was fixed. Two real, independent bugs were found and fixed here:
+Cross-checked directly against localtuya's discovery.py AND tinytuya's
+core/udp_helper.py (both `master`/current). Two prior real bugs fixed here
+(v0.2.2): the AES key needed an MD5 derivation step it was missing, plus a
+one-character typo in the seed string.
 
-1. The AES key for port 6667 is `MD5(b"yGAdlopoPVldABfn")` - a derived
-   16-byte digest, not the 16-character seed string used directly as the
-   key (this module previously used the raw seed bytes AS the key).
-2. That seed string itself had a one-character typo ("PVLd" vs the correct
-   "PVld"). Both bugs were on the same constant, so decrypting 6667
-   broadcasts never actually worked - only unencrypted 6666 ever did.
+**Which framing a packet uses is determined by a prefix INSIDE the packet,
+not by which port it arrived on** (tinytuya's own decoder is portless
+for exactly this reason - a given device's protocol generation decides its
+format, independent of port):
 
-Also simplified port binding to match localtuya's proven approach:
-`asyncio.create_datagram_endpoint(local_addr=..., reuse_port=True)`
-directly, instead of manually building a socket with SO_REUSEADDR - the
-`reuse_port` kwarg already sets SO_REUSEPORT before bind, which is the
-correct/modern mechanism for multiple UDP listeners sharing a port (the
-old SO_REUSEADDR-based approach from v0.1.1 wasn't wrong, just more code
-than necessary for the same result, and untested against how localtuya -
-the thing most likely to be sharing this port - actually behaves).
+- prefix `0x000055AA`: the classic frame this integration's LAN control
+  protocol also uses (see tuya_lan.py) - AES-ECB encrypted (or, on 6666,
+  sometimes already-plaintext JSON) payload, WITH the same 4-byte retcode
+  field between header and payload that tuya_lan.py's receive path needed
+  fixing for (see that module's v0.2.7 fix - applies here identically).
+- prefix `0x00006699`: a newer, HMAC-based frame used by protocol 3.4+
+  devices' broadcasts. Genuinely NOT implemented here (matches this
+  project's existing, explicit 3.4/3.5 scope gap for the control
+  protocol) - detected and logged at debug level so a device using it
+  shows up as a clear "unsupported format" line instead of vanishing
+  silently into the same catch-all as a malformed/unrelated packet.
+- anything else (no valid 16-byte Tuya header at all): last-resort
+  fallback, try decrypting the ENTIRE raw datagram directly (matches
+  tinytuya's own fallback for legacy/non-standard broadcast shapes).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import struct
 from dataclasses import dataclass
 from hashlib import md5
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
-from .const import DISCOVERY_TIMEOUT, UDP_KEY_SEED, UDP_PORT_ENCRYPTED, UDP_PORT_UNENCRYPTED
+from .const import (
+    DISCOVERY_TIMEOUT,
+    UDP_KEY_SEED,
+    UDP_PORT_APP,
+    UDP_PORT_ENCRYPTED,
+    UDP_PORT_UNENCRYPTED,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 UDP_KEY_ENCRYPTED = md5(UDP_KEY_SEED).digest()
+
+PREFIX_55AA = 0x000055AA
+PREFIX_6699 = 0x00006699
+_HEADER_SIZE = 16  # prefix+seq+command+length (same as tuya_lan.py)
+_RETCODE_SIZE = 4  # only present on device->us frames, see tuya_lan.py's fix
+_FOOTER_SIZE = 8  # crc32+suffix
 
 
 @dataclass
@@ -57,21 +79,62 @@ class DiscoveredDevice:
     version: str | None
 
 
+def _decrypt_55aa(data: bytes) -> bytes | None:
+    """Extract + decrypt a classic 0x55AA-framed broadcast payload,
+    accounting for the retcode field (same fix as tuya_lan.py v0.2.7)."""
+    if len(data) < _HEADER_SIZE:
+        return None
+    _prefix, _seq, _cmd, length = struct.unpack(">IIII", data[:_HEADER_SIZE])
+    payload_start = _HEADER_SIZE + _RETCODE_SIZE
+    payload_len = length - _RETCODE_SIZE - _FOOTER_SIZE
+    payload = data[payload_start : payload_start + max(payload_len, 0)]
+    if not payload:
+        return None
+    if payload[:1] == b"{" and payload[-1:] == b"}":
+        return payload  # already-plaintext JSON (common on port 6666)
+    try:
+        cipher = AES.new(UDP_KEY_ENCRYPTED, AES.MODE_ECB)
+        return unpad(cipher.decrypt(payload), 16)
+    except (ValueError, KeyError):
+        return None
+
+
+def _decode_broadcast(data: bytes) -> dict | None:
+    """Decode one broadcast datagram regardless of which port it arrived
+    on - see module docstring for the three cases handled."""
+    if len(data) >= 4:
+        (prefix,) = struct.unpack(">I", data[:4])
+        if prefix == PREFIX_55AA:
+            payload = _decrypt_55aa(data)
+            if payload is None:
+                return None
+            try:
+                return json.loads(payload)
+            except (ValueError, TypeError):
+                return None
+        if prefix == PREFIX_6699:
+            _LOGGER.debug(
+                "Discovery: received a 0x6699-framed (protocol 3.4+ app) broadcast - "
+                "this format is not implemented yet, skipping"
+            )
+            return None
+    # Fallback: no recognizable header at all - try decrypting the whole
+    # raw datagram directly (matches tinytuya's own last-resort path).
+    try:
+        cipher = AES.new(UDP_KEY_ENCRYPTED, AES.MODE_ECB)
+        payload = unpad(cipher.decrypt(data), 16)
+        return json.loads(payload)
+    except Exception:  # noqa: BLE001 - best-effort discovery, skip bad frames
+        return None
+
+
 class _DiscoveryProtocol(asyncio.DatagramProtocol):
-    def __init__(self, encrypted: bool, results: dict[str, DiscoveredDevice]) -> None:
-        self.encrypted = encrypted
+    def __init__(self, results: dict[str, DiscoveredDevice]) -> None:
         self.results = results
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: D102
-        try:
-            # Strip the same 16-byte header/4-byte footer framing used by
-            # the control protocol (see tuya_lan.py PREFIX/SUFFIX/HEADER_SIZE).
-            payload = data[20:-8] if len(data) > 28 else data
-            if self.encrypted:
-                cipher = AES.new(UDP_KEY_ENCRYPTED, AES.MODE_ECB)
-                payload = unpad(cipher.decrypt(payload), 16)
-            obj = json.loads(payload)
-        except Exception:  # noqa: BLE001 - best-effort discovery, skip bad frames
+        obj = _decode_broadcast(data)
+        if not obj:
             return
         gw_id = obj.get("gwId")
         if not gw_id:
@@ -85,15 +148,15 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
 
 
 async def discover_devices(timeout: float = DISCOVERY_TIMEOUT) -> dict[str, DiscoveredDevice]:
-    """Listen on both broadcast ports for `timeout` seconds, return devices found."""
+    """Listen on all three broadcast ports for `timeout` seconds, return devices found."""
     loop = asyncio.get_event_loop()
     results: dict[str, DiscoveredDevice] = {}
 
     transports = []
-    for port, encrypted in ((UDP_PORT_UNENCRYPTED, False), (UDP_PORT_ENCRYPTED, True)):
+    for port in (UDP_PORT_UNENCRYPTED, UDP_PORT_ENCRYPTED, UDP_PORT_APP):
         try:
             transport, _ = await loop.create_datagram_endpoint(
-                lambda enc=encrypted: _DiscoveryProtocol(enc, results),
+                lambda: _DiscoveryProtocol(results),
                 local_addr=("0.0.0.0", port),
                 reuse_port=True,
             )
@@ -109,8 +172,8 @@ async def discover_devices(timeout: float = DISCOVERY_TIMEOUT) -> dict[str, Disc
 
     if not transports:
         _LOGGER.error(
-            "Discovery could not bind ANY UDP port (6666/6667) - devices will never be "
-            "found this way; use manual IP entry instead"
+            "Discovery could not bind ANY UDP port (6666/6667/7000) - devices will "
+            "never be found this way; use manual IP entry instead"
         )
 
     try:

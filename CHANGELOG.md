@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.2.9 - fix: missing third discovery port (7000), only listened on 2 of 3
+
+The user's own insight ("antes hablaba con dispositivos... hay dos partes
+del protocolo, solo has implementado uno") pointed at the real gap after
+v0.2.8's diff against localtuya found nothing wrong: **there's a THIRD
+Tuya broadcast port, 7000 ("Tuya app" port), never listened on at all**.
+Confirmed against tinytuya's `scanner.py`/`core/const.py`
+(`UDPPORTAPP = 7000`) - newer/app-paired devices commonly broadcast here
+instead of, or in addition to, 6666/6667. Devices that only ever showed
+up on 7000 were invisible to this integration's discovery no matter how
+correct the 6666/6667 handling was.
+
+While adding it, also generalized how a packet's format is decoded:
+**which framing a broadcast uses is determined by a prefix INSIDE the
+packet, not by which port it arrived on** (confirmed against both
+localtuya and tinytuya - tinytuya's own decoder is portless for exactly
+this reason). `_decode_broadcast()` now checks the prefix explicitly:
+
+- `0x000055AA` (the classic frame, same one `tuya_lan.py` uses): decoded
+  with the SAME retcode-aware logic as that module's v0.2.7 fix - this
+  bug applied here too and is fixed the same way.
+- `0x00006699`: a newer, HMAC-based frame used by protocol 3.4+ devices'
+  broadcasts. Genuinely NOT implemented (matches the control protocol's
+  existing, explicit 3.4/3.5 scope gap) - now detected and logged at
+  debug level instead of silently vanishing into the same catch-all as a
+  malformed packet, so a report about this specific gap is diagnosable
+  rather than indistinguishable from "nothing received at all".
+- anything else: last-resort fallback, decrypt the whole raw datagram
+  directly (matches tinytuya's own fallback path for legacy shapes).
+
+Verified with direct decode tests: an encrypted 0x55AA broadcast, a
+plaintext-JSON 0x55AA broadcast, and a 0x6699 broadcast (confirmed
+recognized and cleanly skipped, not crashing/misparsed as garbage).
+
 ## v0.2.8 - bit-packed DP support (display light/buzzer), discovery diagnostics
 
 - **New: `DPMapping.bit` for bit-packed DPs.** Some Tuya devices (this
