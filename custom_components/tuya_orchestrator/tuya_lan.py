@@ -63,6 +63,12 @@ CMD_STATUS = 0x0A  # DP_QUERY
 CMD_CONTROL = 0x07  # CONTROL (set DPs)
 CMD_HEARTBEAT = 0x09
 
+# How often to ping the device to keep the TCP connection (and this
+# project's whole "reactive, not polling" design - see coordinator.py -
+# which depends on that connection staying open to receive unsolicited
+# push updates) alive. Matches localtuya's own HEARTBEAT_INTERVAL exactly.
+HEARTBEAT_INTERVAL = 10
+
 # Protocol 3.2+/3.3 prepends this 15-byte header to the CIPHERTEXT of most
 # commands (CONTROL included) - but NOT DP_QUERY/HEART_BEAT. See
 # _send_receive()'s comment for how this was found (diffed against
@@ -114,6 +120,7 @@ class TuyaLocalDevice:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._listen_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
@@ -123,10 +130,48 @@ class TuyaLocalDevice:
             asyncio.open_connection(self.address, self.port), timeout=timeout
         )
         self._listen_task = asyncio.ensure_future(self._listen())
+        # GAP FIXED HERE (found reviewing localtuya's pytuya/__init__.py's
+        # TuyaProtocol.start_heartbeat()): without a periodic HEART_BEAT,
+        # a real device can silently drop this TCP connection after a
+        # short idle period - the CMD_HEARTBEAT constant existed but was
+        # never actually sent anywhere. Reconnecting lazily on the next
+        # status()/set_dps() call still works, but every idle-then-dropped
+        # gap means missing whatever unsolicited push updates would have
+        # arrived on the (now-closed) connection in between - directly
+        # undermining this project's "reactive, not polling" design
+        # (coordinator.py), silently degrading it to poll-only whenever
+        # the device's own idle-timeout is shorter than the coordinator's
+        # scan_interval (30s default).
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
 
     async def close(self) -> None:
         if self._listen_task:
             self._listen_task.cancel()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        if self._writer:
+            self._writer.close()
+
+    async def heartbeat(self) -> None:
+        """Send one HEART_BEAT - matches the reference's 2-field payload
+        (gwId/devId only, unlike DP_QUERY's 4-field one)."""
+        obj = {"gwId": self.device_id, "devId": self.device_id}
+        await self._send_receive(CMD_HEARTBEAT, obj)
+
+    async def _heartbeat_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                try:
+                    await self.heartbeat()
+                except asyncio.TimeoutError:
+                    _LOGGER.debug("%s: heartbeat timed out, closing connection", self.device_id)
+                    break
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("%s: heartbeat failed (%s), closing connection", self.device_id, err)
+                    break
+        except asyncio.CancelledError:
+            return
         if self._writer:
             self._writer.close()
 

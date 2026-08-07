@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.3.1 - fix: LAN control connection never sent a heartbeat, silently degrading the "reactive" design
+
+Continued review ("sigue revisando") into the LAN control protocol's
+connection lifecycle after the discovery-side architectural fix (v0.3.0).
+Diffed `tuya_lan.py`'s connection handling against localtuya's
+`TuyaProtocol.start_heartbeat()`/`heartbeat_loop()` and found a real gap:
+**this integration never sent a single HEART_BEAT, ever** - the
+`CMD_HEARTBEAT` constant existed but nothing in the codebase used it.
+
+Real Tuya devices commonly drop an idle TCP connection after a short
+timeout if they don't see a periodic heartbeat. Reconnecting lazily on
+the next `status()`/`set_dps()` call still works (this integration
+already does that), but every idle-then-dropped gap means missing
+whatever unsolicited push updates would have arrived on the now-closed
+connection in the meantime - directly undermining this project's stated
+"reactive, not polling" design (`coordinator.py`'s whole premise) any
+time a device's own idle timeout is shorter than the coordinator's
+`scan_interval` (30s default). This wouldn't show up as an error, just as
+occasionally-stale state and delayed reactions to real device changes -
+plausibly part of what's still felt "not fully working" after the more
+obviously-broken bugs (parsing, payload fields, discovery) were fixed.
+
+Fixed to match the reference: a background loop sends `HEART_BEAT` every
+`HEARTBEAT_INTERVAL` (10s, same value localtuya uses) for as long as the
+connection is open, closing the connection (letting the existing lazy
+reconnect handle the rest) if a heartbeat ever fails/times out - same
+failure behavior as the reference. `heartbeat()`'s payload is 2 fields
+(gwId/devId), NOT DP_QUERY's 4 - verified directly against the reference's
+`payload_dict`. Verified with two direct tests: the payload shape is
+exactly right, and the loop genuinely fires repeatedly over real elapsed
+time (not just structurally present but never actually running).
+
 ## v0.3.0 - persistent discovery listener (architectural fix, not another protocol bug)
 
 Requested explicitly ("revisa el código entero de localtuya") after
