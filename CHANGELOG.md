@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.1.1 - first live bug report, discovery port conflict
+
+- **Fixed**: `discover_devices()` failed to bind UDP ports 6666/6667
+  ("Address already in use", errno 98) on any host that already has
+  another Tuya listener running (LocalTuya, the official Tuya integration,
+  a previous instance of this one) - devices were never found via LAN
+  broadcast, every time, not intermittently. Root cause:
+  `asyncio.create_datagram_endpoint(local_addr=...)` doesn't set
+  `SO_REUSEADDR`/`SO_REUSEPORT` before binding. Fixed by building the
+  socket manually with both set (where the platform supports
+  `SO_REUSEPORT`) before `bind()`, then handing that socket to
+  `create_datagram_endpoint(sock=...)`. Verified locally by simulating the
+  exact conflict (two competing binds to the same port). Caveat
+  documented in `discovery.py`: on Linux, `SO_REUSEPORT` only works if
+  *every* process sharing the port sets it - if the other Tuya integration
+  doesn't, the bind can still fail; manual IP entry remains the fallback.
+- First confirmed report from an actual live Home Assistant install -
+  this is the first change made in response to real runtime behavior
+  rather than review-only.
+
 ## v0.1.0 - initial scaffold
 
 - Custom component `tuya_orchestrator`, one ConfigEntry per device.
