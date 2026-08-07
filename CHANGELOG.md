@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.3.2 - fix: CONTROL command sent an extra, unexpected field
+
+Continued review ("sigue revisando") of `common.py` and `_generate_payload`'s
+`payload_dict` in localtuya's reference. Confirmed the `dps_to_request`/
+`type_0d` mechanism seen there is a narrower device-family quirk, not
+something the default device profile needs (its DP_QUERY template has no
+explicit DP list, matching what v0.2.4 already fixed) - not a new gap.
+
+Did find one: **the reference's CONTROL payload template is exactly
+`devId`/`uid`/`t`/`dps` - no `gwId`.** `set_dps()` sent `gwId` too, an
+extra field the real template doesn't have. This was never verified
+against a live device actually accepting a control command - the earlier
+DP_QUERY bug (v0.2.4) blocked pairing before any `set_dps()` call was
+ever tried for real, so an unverified extra field sitting in the control
+payload this whole time is a real possibility for at least part of "puedo
+conectar pero no puedo controlar" style symptoms. Now matches the
+reference exactly. Verified directly that the payload no longer includes
+`gwId` while keeping the three required fields plus `dps`.
+
 ## v0.3.1 - fix: LAN control connection never sent a heartbeat, silently degrading the "reactive" design
 
 Continued review ("sigue revisando") into the LAN control protocol's

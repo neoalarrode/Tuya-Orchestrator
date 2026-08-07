@@ -206,10 +206,17 @@ class TuyaLocalDevice:
         return _extract_dps(reply)
 
     async def set_dps(self, dps: dict[int, Any]) -> dict[int, Any]:
-        """Set one or more datapoints."""
+        """Set one or more datapoints (command CONTROL, 0x07)."""
+        # BUG FIXED HERE (same diffing pass that found the heartbeat gap):
+        # the reference's CONTROL payload template is exactly
+        # devId/uid/t/dps - NOT gwId/devId/uid/t/dps. This sent an extra,
+        # unexpected `gwId` field on every set_dps() call - never verified
+        # against a live device actually accepting a control command (the
+        # DP_QUERY bug blocked pairing before any control command was ever
+        # tried for real), so this may well be why. Matching the reference
+        # exactly now rather than leaving an unverified extra field in.
         payload = {
             "devId": self.device_id,
-            "gwId": self.device_id,
             "uid": self.device_id,
             "t": str(int(time.time())),
             "dps": {str(k): v for k, v in dps.items()},
