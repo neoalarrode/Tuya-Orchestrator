@@ -269,6 +269,29 @@ class _RawFrame:
 
 
 def _try_parse(buf: bytes) -> tuple[_RawFrame | None, int]:
+    """Parse ONE incoming (device -> us) frame.
+
+    FUNDAMENTAL BUG FIXED HERE (found by diffing against localtuya's real
+    `unpack_message()`): a message the DEVICE sends carries a 4-byte
+    `retcode` field between the header and the encrypted payload - present
+    on every real reply/push, but absent from what WE send (our own
+    `_frame()`/send-side header is correctly retcode-less, matching the
+    reference's send-side `MESSAGE_HEADER_FMT`). This function used the
+    same 16-byte header with NO retcode skip for parsing INCOMING frames
+    too, so every decrypt attempt started 4 bytes too early (into the
+    retcode, not the ciphertext) and ran 4 bytes too long - silently
+    caught by _listen()'s broad except and discarded as an unparseable
+    frame. Net effect: DP_QUERY replies and ALL push updates were corrupt
+    from the very first byte, forever - status() never raised or timed
+    out (the sequence number still matched, so the waiting future still
+    resolved), it just always resolved to an EMPTY dps dict. This is the
+    real reason every entity showed no current value with no visible
+    error, independent of (and more fundamental than) the DP_QUERY
+    payload-field and coordinator-merge fixes from the same investigation.
+
+    `length` (parsed from the header) counts retcode(4) + payload + crc/
+    suffix(8) - i.e. everything after the 16-byte header.
+    """
     if len(buf) < HEADER_SIZE:
         return None, 0
     prefix, seq, command, length = struct.unpack(">IIII", buf[:HEADER_SIZE])
@@ -277,8 +300,10 @@ def _try_parse(buf: bytes) -> tuple[_RawFrame | None, int]:
     total = HEADER_SIZE + length
     if len(buf) < total:
         return None, 0
-    payload_len = length - FOOTER_SIZE
-    payload = buf[HEADER_SIZE : HEADER_SIZE + payload_len]
+    retcode_size = 4
+    payload_len = length - retcode_size - FOOTER_SIZE
+    payload_start = HEADER_SIZE + retcode_size
+    payload = buf[payload_start : payload_start + payload_len]
     return _RawFrame(seq, command, payload), total
 
 

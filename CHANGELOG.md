@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.7 - fix: FUNDAMENTAL receive-parsing bug, every device reply was corrupt
+
+The real root cause behind "no puedo setear la temperatura" and "sigue
+sin consultar el estado real" persisting after v0.2.3-v0.2.6's fixes -
+this one is more foundational than any of those.
+
+**Every message the device sends back (DP_QUERY replies AND unsolicited
+push updates alike) carries a 4-byte `retcode` field between the header
+and the encrypted payload - present only on what the DEVICE sends, not on
+what we send.** `_try_parse()` used the same 16-byte, retcode-less layout
+for parsing INCOMING frames as for our own outgoing ones, so every decrypt
+attempt started 4 bytes too early (into the retcode, not the ciphertext)
+and ran 4 bytes too long. This was silently caught by `_listen()`'s broad
+except-and-skip and treated as an unparseable frame.
+
+Net effect: `status()` never raised or timed out (the sequence number
+still matched what we sent, so the waiting future still resolved) - it
+just always resolved to an empty dps dict, forever. No error, nothing to
+report - exactly the symptom described ("todo aparece vacío" with no
+visible error). This affected BOTH directions of the "bilateral
+communication" the user asked for: reading current DP state (`status()`)
+AND the replies to `set_dps()` commands - independent of, and more
+fundamental than, the DP_QUERY payload-field fix (v0.2.4) or the
+coordinator merge fix (v0.2.5), which were both real but couldn't matter
+if the bytes being parsed were wrong to begin with.
+
+Found by diffing against localtuya's real `unpack_message()` (same
+technique that already caught the v0.2.2/v0.2.4 bugs). Verified with a
+full round-trip test simulating a realistically-shaped device reply
+(header + retcode + encrypted payload + crc + suffix, exactly as a real
+device sends it) through the fixed parser - decrypts correctly now.
+
 ## v0.2.6 - fix: enum options showing as bare digits ("0"/"1"/"2"...)
 
 Reported as "swing mode incomplete, shows only numbers" - the AC's
