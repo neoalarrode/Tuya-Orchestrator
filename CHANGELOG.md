@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.6 - fix: enum options showing as bare digits ("0"/"1"/"2"...)
+
+Reported as "swing mode incomplete, shows only numbers" - the AC's
+`up_down_sweep` DP has 4 real states (`0`-`3`, per Tuya's own schema
+description: none/up-down/up-only/down-only), but no semantic NAME
+anywhere in the normalized schema this integration reads, so `_humanize()`
+- a no-op on a purely numeric string - left them as bare "0"/"1"/"2"/"3"
+in the swing-mode dropdown. New `_label_for_enum_value()` labels a
+numeric-only raw value as "<Field name> Position N" instead (e.g. "Up
+Down Sweep Position 1") - still never invents what a position actually
+MEANS (no guessing "0 = Off"), just makes each option identifiable
+instead of an ambiguous bare digit. Applied everywhere an enum map is
+built: climate fan/preset/swing, vacuum fan speed, and the generic
+select/sensor fallback.
+
+Verified live against the Tuya Cloud API that `up_down_sweep` genuinely
+has 4 options, not 3 - a device already paired before this fix (or before
+v0.2.0-v0.2.5's other schema fixes) keeps whatever profile was generated
+at pairing time; re-adding or editing its profile via Options is needed
+to pick up everything fixed this session at once.
+
 ## v0.2.5 - fix: heat_cool setpoint invisible, coordinator wiping known DP values
 
 Two more from live testing on the AC:

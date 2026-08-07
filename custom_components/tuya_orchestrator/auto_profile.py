@@ -92,6 +92,22 @@ def _humanize(code: str) -> str:
     return " ".join(w.upper() if w.lower() in ("led", "id", "ac", "rgb") else w.capitalize() for w in words if w)
 
 
+def _label_for_enum_value(raw: str, field_name: str | None = None) -> str:
+    """Label for one enum option. `_humanize` alone is a no-op on a purely
+    numeric raw value (Tuya position/level DPs are commonly encoded as
+    plain digit strings like "0"/"1"/"2" with no semantic name anywhere in
+    the cloud schema this integration reads) - "0" stayed "0", useless in
+    a select/swing-mode dropdown. Real example that prompted this: an AC's
+    swing positions showed as bare "0"/"1"/"2"/"3". Never invents what a
+    position MEANS (e.g. guessing "0 = Off") - just makes each option
+    identifiable by field name + index instead of a bare, ambiguous digit.
+    """
+    if raw.lstrip("-").isdigit():
+        prefix = f"{field_name} " if field_name else ""
+        return f"{prefix}Position {raw}"
+    return _humanize(raw)
+
+
 _PLAUSIBLE_SETPOINT_MAX_C = 50  # no real consumer AC/heater setpoint goes above this
 
 
@@ -161,7 +177,7 @@ def _try_build_climate(
         raw_range = f.get("values", {}).get("range", [])
         if raw_range:
             cm.fan_dp = f["dp_id"]
-            cm.fan_map = {raw: _humanize(raw) for raw in raw_range}
+            cm.fan_map = {raw: _label_for_enum_value(raw, "Fan") for raw in raw_range}
             consumed.add(f["code"])
 
     if "humidity" in roles:
@@ -174,7 +190,7 @@ def _try_build_climate(
         raw_range = p.get("values", {}).get("range", [])
         if raw_range:
             cm.preset_dp = p["dp_id"]
-            cm.preset_map = {raw: _humanize(raw) for raw in raw_range}
+            cm.preset_map = {raw: _label_for_enum_value(raw, "Preset") for raw in raw_range}
             consumed.add(p["code"])
 
     if "swing" in roles:
@@ -182,7 +198,8 @@ def _try_build_climate(
         raw_range = sw.get("values", {}).get("range", [])
         if raw_range:
             cm.swing_dp = sw["dp_id"]
-            cm.swing_map = {raw: _humanize(raw) for raw in raw_range}
+            field_name = _humanize(sw["code"])  # e.g. "Up Down Sweep" - more specific than a bare "Swing"
+            cm.swing_map = {raw: _label_for_enum_value(raw, field_name) for raw in raw_range}
             consumed.add(sw["code"])
 
     return cm
@@ -281,7 +298,7 @@ def _try_build_vacuum(by_code: dict[str, dict], consumed: set[str]) -> VacuumMap
         raw_range = f.get("values", {}).get("range", [])
         if raw_range:
             vm.fan_speed_dp = f["dp_id"]
-            vm.fan_speed_map = {raw: _humanize(raw) for raw in raw_range}
+            vm.fan_speed_map = {raw: _label_for_enum_value(raw, "Fan speed") for raw in raw_range}
             consumed.add(f["code"])
 
     return vm
@@ -337,7 +354,7 @@ def _auto_dp_mapping(entry: dict[str, Any]) -> DPMapping | None:
     if dtype == "enum":
         raw_range = values.get("range", [])
         platform = "select" if access in ("rw", "wr") else "sensor"
-        value_map = {raw: _humanize(raw) for raw in raw_range} if raw_range else None
+        value_map = {raw: _label_for_enum_value(raw, name) for raw in raw_range} if raw_range else None
         return DPMapping(dp_id=dp_id, platform=platform, name=name, value_map=value_map)
 
     # bitmap / string / raw / json - expose as a raw, undecoded sensor
