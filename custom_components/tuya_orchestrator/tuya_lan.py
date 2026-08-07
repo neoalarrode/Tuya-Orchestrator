@@ -8,15 +8,34 @@ Wire format (protocol versions 3.1/3.3), all fields big-endian:
 
     0x000055AA | seq(4) | command(4) | length(4) | payload[...] | crc32(4) | 0x0000AA55
 
-`length` counts payload + crc32 + suffix (8 bytes). For protocol 3.3+ the
-payload is AES-128-ECB encrypted with the device's local_key (PKCS7 padded);
-for 3.1, DPS payloads are AES-encrypted then hex-encoded and wrapped with an
-MD5-based signature prefix. Protocol 3.4/3.5 additionally require a
-session-key handshake (HMAC-SHA256) before any DP exchange.
+`length` counts payload + crc32 + suffix (8 bytes). The payload itself is
+AES-128-ECB encrypted with the device's local_key (PKCS7 padded). Protocol
+3.4/3.5 additionally require a session-key handshake (HMAC-SHA256) before
+any DP exchange.
 
-Known limitation (documented on purpose, see project README): 3.4/3.5
-session-key handshake is NOT implemented yet - only 3.1 and 3.3 devices are
-supported in this version. Most Tuya LAN-capable devices manufactured before
+Verified against localtuya's real implementation
+(custom_components/localtuya/pytuya/__init__.py) after live-device reports
+surfaced two real bugs this fixed:
+
+- Protocol 3.3 prepends a 15-byte plaintext header (`b"3.3" + 12 zero
+  bytes`) to the CIPHERTEXT of most commands (CONTROL included) - but NOT
+  DP_QUERY/HEART_BEAT. This was missing entirely on the send side (would
+  have broken every set_dps() control command on a real 3.3 device) and
+  unhandled on the receive side (an incoming push/reply carrying it would
+  fail to decrypt). Both fixed, symmetric header-prepend/strip.
+- DP_QUERY's payload needs FOUR fields (gwId/devId/uid/t), not two
+  (gwId/devId) - a real AC closed the connection outright on the
+  incomplete request ("Connection lost").
+
+Known limitation, honestly narrower than it first looks: **protocol 3.1's
+CONTROL command uses a DIFFERENT mechanism entirely** (an MD5-hexdigest
+signature prefix instead of the plain 15-byte header 3.3 uses) which is
+NOT implemented here - only 3.1's DP_QUERY (status reads) has been
+verified correct-in-principle against the reference; sending commands
+(turning something on/off) to a 3.1 device is unverified and likely
+broken until that MD5 path is added. 3.3 is the one that's been checked
+against a live device end to end. Protocol 3.4/3.5's session-key handshake
+is NOT implemented at all yet - most Tuya devices manufactured before
 ~2022 use 3.1/3.3. Attempting to use protocol_version="3.4" raises
 NotImplementedError with a clear message rather than failing silently.
 """
@@ -43,6 +62,12 @@ FOOTER_SIZE = 8  # crc32+suffix
 CMD_STATUS = 0x0A  # DP_QUERY
 CMD_CONTROL = 0x07  # CONTROL (set DPs)
 CMD_HEARTBEAT = 0x09
+
+# Protocol 3.2+/3.3 prepends this 15-byte header to the CIPHERTEXT of most
+# commands (CONTROL included) - but NOT DP_QUERY/HEART_BEAT. See
+# _send_receive()'s comment for how this was found (diffed against
+# localtuya's real pytuya implementation) and why it matters.
+_VERSION_33_HEADER = b"3.3" + b"\x00" * 12
 
 
 def _crc32(data: bytes) -> int:
@@ -111,18 +136,27 @@ class TuyaLocalDevice:
 
     # -- public API -------------------------------------------------------------
     async def status(self) -> dict[int, Any]:
-        """Query current DP values."""
-        # BUG FIXED HERE: this used to pre-encode the payload via
-        # _build_payload() (-> bytes) and pass THAT as `obj` into
-        # _send_receive(), which itself calls _build_payload(obj) again
-        # internally (it expects a plain dict, same as set_dps() already
-        # correctly passes one). json.dumps() on an already-bytes object
-        # raised "Object of type bytes is not JSON serializable" - this hit
-        # every device's very first status refresh
-        # (coordinator.async_config_entry_first_refresh()), so no device
-        # could ever actually connect. First real live-LAN report caught
-        # this; set_dps() never had the bug, only status() did.
-        obj = {"gwId": self.device_id, "devId": self.device_id}
+        """Query current DP values (command DP_QUERY, 0x0A)."""
+        # BUG FIXED HERE (found by diffing against localtuya's real
+        # pytuya/__init__.py `payload_dict`): DP_QUERY's expected payload
+        # for the default ("type_0a") device profile is FOUR fields -
+        # gwId, devId, uid, t (timestamp) - this only ever sent two
+        # (gwId, devId). A device receiving an incomplete DP_QUERY request
+        # can reject/close the connection outright rather than reply -
+        # surfaced as "Could not reach device on LAN: Connection lost"
+        # on a live AC. `uid` follows the same convention already used
+        # (correctly) in set_dps() below: falls back to device_id.
+        #
+        # (A prior bug here - pre-encoding the payload to bytes before
+        # calling _send_receive(), which double-JSON-encoded it - was
+        # fixed separately; this is a second, independent bug in what
+        # fields the payload actually needs.)
+        obj = {
+            "gwId": self.device_id,
+            "devId": self.device_id,
+            "uid": self.device_id,
+            "t": str(int(time.time())),
+        }
         reply = await self._send_receive(CMD_STATUS, obj)
         return _extract_dps(reply)
 
@@ -163,10 +197,19 @@ class TuyaLocalDevice:
         self._seq += 1
         seq = self._seq
         raw = self._build_payload(obj)
-        if self.protocol_version == "3.3":
-            enc = self._encrypt(raw)
-        else:  # 3.1 - DPS payloads are also AES-encrypted on the wire
-            enc = self._encrypt(raw)
+        enc = self._encrypt(raw)
+        # BUG FIXED HERE (found by diffing against localtuya's real
+        # pytuya/__init__.py): protocol 3.2+/3.3 requires a 15-byte
+        # version header (b"3.3" + 12 zero bytes) PREPENDED TO THE
+        # CIPHERTEXT for most commands - but NOT for DP_QUERY/HEART_BEAT,
+        # which go out as plain ciphertext. This was missing entirely, so
+        # CONTROL (set_dps) commands on a real 3.3 device were malformed -
+        # the device would very likely reject/ignore them (this integration
+        # never got far enough to report that specific symptom yet, since
+        # the DP_QUERY payload bug below blocked pairing before any
+        # set_dps() call was ever attempted against a real device).
+        if self.protocol_version == "3.3" and command not in (CMD_STATUS, CMD_HEARTBEAT):
+            enc = _VERSION_33_HEADER + enc
         packet = self._frame(seq, command, enc)
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -194,7 +237,15 @@ class TuyaLocalDevice:
                         break
                     buf = buf[consumed:]
                     try:
-                        payload = self._decrypt(msg.payload) if msg.payload else b""
+                        raw = msg.payload
+                        # Symmetric with _send_receive()'s header-prepend:
+                        # an incoming 3.3 payload may start with the same
+                        # plaintext "3.3"+12 zero bytes header (checked
+                        # BEFORE decrypting, since the header itself isn't
+                        # encrypted) - strip it if present.
+                        if raw[: len(_VERSION_33_HEADER)] == _VERSION_33_HEADER:
+                            raw = raw[len(_VERSION_33_HEADER):]
+                        payload = self._decrypt(raw) if raw else b""
                         obj = json.loads(payload) if payload else None
                     except Exception:  # noqa: BLE001 - malformed/heartbeat frame
                         obj = None

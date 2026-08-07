@@ -370,6 +370,28 @@ def build_profile_from_schema(
         if (vm := _try_build_vacuum(by_code, consumed)) is not None:
             vacuums.append(vm)
 
+    # Hide unit-twin DPs of anything already consumed - Tuya's convention
+    # is a plain "_f" suffix for the Fahrenheit twin of an already-exposed
+    # Celsius DP (temp_set/temp_set_f, temp_current/temp_current_f...).
+    # Real example that prompted this: an AC's climate entity already
+    # exposes target_temperature in °C (from temp_set); temp_set_f was
+    # still showing up as a second, disconnected, redundant setpoint
+    # control for the exact same physical value. Only hides it when the
+    # Celsius twin was ACTUALLY consumed (climate/light/vacuum build
+    # succeeded) - an unmatched _f-suffixed DP on its own still surfaces
+    # normally, nothing is dropped silently for devices with no composite.
+    lower_consumed = {c.lower() for c in consumed}
+    for entry in schema:
+        code = entry["code"]
+        if code.lower().endswith("_f") and code.lower()[:-2] in lower_consumed:
+            consumed.add(code)
+            warnings.append(
+                f"'{code}' (dp {entry['dp_id']}) looks like the Fahrenheit twin of "
+                f"an already-exposed Celsius DP - hidden to avoid a duplicate, "
+                f"disconnected setpoint control. Add it back manually under `dps:` "
+                f"if you actually want both units controllable separately."
+            )
+
     dps = [
         mapping
         for entry in schema

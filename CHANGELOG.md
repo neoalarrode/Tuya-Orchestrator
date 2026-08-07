@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.2.4 - fix: "Connection lost" on real device, missing 3.3 control header, duplicate °F control
+
+From an AC pairing attempt: "Could not reach device on LAN: Connection
+lost". Diffed `tuya_lan.py` against localtuya's real
+`pytuya/__init__.py` (same technique that already caught the discovery.py
+bugs in v0.2.2) and found two more real, independent protocol bugs:
+
+- **DP_QUERY payload was missing two required fields.** The reference's
+  payload template for DP_QUERY (status query, the very first thing
+  tried against any device) is FOUR fields - `gwId`, `devId`, `uid`, `t`
+  (timestamp) - this only ever sent two (`gwId`, `devId`). A real AC
+  closed the TCP connection outright on the incomplete request, matching
+  the reported "Connection lost" exactly. Fixed to send all four.
+- **Protocol 3.3's required 15-byte version header was missing
+  entirely**, both directions. 3.3 prepends `b"3.3" + 12 zero bytes` in
+  PLAINTEXT to the ciphertext of most commands (CONTROL included) - but
+  NOT DP_QUERY/HEART_BEAT. This integration never added it on send (every
+  `set_dps()` control command - turning something on/off, changing a
+  setpoint - would have been malformed on a real 3.3 device) and didn't
+  strip it on receive either (an incoming frame carrying it would fail to
+  decrypt). Both fixed, verified with direct payload-building tests
+  (encrypt+header-prepend on send, header-strip+decrypt round-trip on
+  receive) since a live 3.3 device isn't available in this sandbox.
+- Corrected the module docstring, which had claimed 3.1 was equivalently
+  supported - it isn't: 3.1's CONTROL command uses a completely different
+  mechanism (MD5-hexdigest signature, not the plain header 3.3 uses),
+  still not implemented. Only 3.3 has been checked end-to-end against a
+  real device's actual DP_QUERY failure/fix cycle.
+
+Also, a second report from the same AC: the auto-generated profile still
+listed a redundant Fahrenheit setpoint control (`temp_set_f`) alongside
+the climate entity's Celsius `target_temperature` - same physical value,
+two disconnected controls. `build_profile_from_schema` now hides any
+`_f`-suffixed DP whose Celsius twin was already consumed into a
+composite entity (climate/light/vacuum), with an explicit warning saying
+so - nothing is silently dropped, and a device where the twin ISN'T
+already exposed elsewhere still gets it as a normal `dps:` entry.
+
 ## v0.2.3 - fix: LAN status query crashed every device, plus sharper AC warning
 
 Two more issues from the first real end-to-end pairing attempt (an
