@@ -1,0 +1,85 @@
+"""Background discovery for the "account" ConfigEntry type.
+
+An account entry holds only Tuya Cloud credentials - no device of its own.
+Once set up, it periodically polls Tuya Cloud for this account's full
+device list plus a LAN broadcast pass, and for every device NOT already
+configured (or ignored) triggers a native HA discovery flow
+(`SOURCE_INTEGRATION_DISCOVERY`) - which HA's frontend renders as a
+"Discovered" card with Configure/Ignore buttons, the same UX pattern as
+HomeKit Controller or Tapo. One ConfigEntry per device is still created
+(same as before), just no longer via a manual multi-step wizard - the
+account entry is the thing that finds them.
+
+Dedup relies on `ConfigFlow.async_set_unique_id()`'s own built-in
+behavior: calling it a second time for a still-in-progress flow with the
+same unique_id aborts as "already_in_progress" automatically, so polling
+every 5 minutes does not spam duplicate discovery cards for a device the
+user hasn't acted on yet. The `configured_ids` check below is a cheap
+pre-filter for devices that already have a real (or ignored) ConfigEntry.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+
+from homeassistant.config_entries import SOURCE_INTEGRATION_DISCOVERY, ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
+
+from .const import (
+    CONF_ACCESS_ID,
+    CONF_ACCESS_SECRET,
+    CONF_ACCOUNT_ENTRY_ID,
+    CONF_REGION,
+    CONF_UID,
+    DISCOVERY_POLL_INTERVAL,
+    DOMAIN,
+)
+from .discovery import discover_devices
+from .tuya_cloud import TuyaCloudApi, TuyaCloudApiError, TuyaCloudAuthError
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    session = async_get_clientsession(hass)
+    api = TuyaCloudApi(
+        session, entry.data[CONF_REGION], entry.data[CONF_ACCESS_ID], entry.data[CONF_ACCESS_SECRET]
+    )
+
+    async def _poll(now=None) -> None:
+        try:
+            await api.validate()
+            devices = await api.get_user_devices(entry.data[CONF_UID])
+        except (TuyaCloudAuthError, TuyaCloudApiError) as err:
+            _LOGGER.warning("Tuya Cloud poll failed for account %s: %s", entry.title, err)
+            return
+
+        lan = await discover_devices()
+        configured_ids = {e.unique_id for e in hass.config_entries.async_entries(DOMAIN) if e.unique_id}
+
+        new_count = 0
+        for device in devices:
+            device_id = device["device_id"]
+            if device_id in configured_ids:
+                continue
+            found = lan.get(device_id)
+            await hass.config_entries.flow.async_init(
+                DOMAIN,
+                context={"source": SOURCE_INTEGRATION_DISCOVERY},
+                data={
+                    **device,
+                    "ip": found.ip if found else None,
+                    "version": found.version if found else None,
+                    CONF_ACCOUNT_ENTRY_ID: entry.entry_id,
+                },
+            )
+            new_count += 1
+        if new_count:
+            _LOGGER.info("Tuya account %s: %s new device(s) offered for discovery", entry.title, new_count)
+
+    unsub = async_track_time_interval(hass, _poll, timedelta(seconds=DISCOVERY_POLL_INTERVAL))
+    entry.async_on_unload(unsub)
+    # First pass shortly after startup - don't block entry setup on it.
+    hass.async_create_task(_poll())

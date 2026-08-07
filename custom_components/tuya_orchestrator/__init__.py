@@ -1,9 +1,14 @@
 """Tuya Orchestrator - fully local (LAN) Tuya device integration with
-declarative, user-editable device profiles (ESPHome-style customization,
+declarative, auto-generated device profiles (ESPHome-style customization,
 Tuya-over-LAN instead of ESPHome-over-WiFi).
 
-One ConfigEntry = one device (same pattern as this project family's other
-integrations - repeat "+ Add integration" per device)."""
+Two kinds of ConfigEntry:
+- "account" (no device of its own): Tuya Cloud credentials, runs a
+  background poller (account.py) that offers newly-seen devices as native
+  HA discovery flows (Configure/Ignore cards).
+- "device" (one per paired device, same as before): the actual LAN
+  connection + entities.
+"""
 from __future__ import annotations
 
 import logging
@@ -11,14 +16,17 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
+from .account import async_setup_account
 from .const import (
     CONF_DEVICE_ID,
+    CONF_ENTRY_TYPE,
     CONF_LOCAL_KEY,
     CONF_PROFILE_YAML,
     CONF_PROTOCOL_VERSION,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    ENTRY_TYPE_ACCOUNT,
     PLATFORMS,
 )
 from .coordinator import TuyaOrchestratorCoordinator
@@ -29,6 +37,13 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_ACCOUNT:
+        await async_setup_account(hass, entry)
+        return True
+    return await _async_setup_device_entry(hass, entry)
+
+
+async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = entry.data
     profile = parse_profile(data[CONF_PROFILE_YAML])
 
@@ -55,6 +70,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_ACCOUNT:
+        return True  # nothing to unload beyond the poller's own async_on_unload
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         stored = hass.data[DOMAIN].pop(entry.entry_id)

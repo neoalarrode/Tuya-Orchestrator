@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.2.0 - account-based discovery (Configure/Ignore UX, like HomeKit/Tapo)
+
+**Config flow rearchitected**, user-requested after the port-conflict
+report exposed how clunky the old "pick one device from a list, per +Add
+integration click" wizard was:
+
+- First "+ Add integration" now sets up an **account** entry (Tuya Cloud
+  credentials only, no device) instead of walking through a device pick
+  immediately.
+- The account entry runs a background poller (`account.py`,
+  `DISCOVERY_POLL_INTERVAL=300s`, plus one pass right at startup) that
+  cross-references the account's full cloud device list against LAN
+  broadcast + already-configured/ignored devices, and triggers a native HA
+  discovery flow (`SOURCE_INTEGRATION_DISCOVERY`) for every genuinely new
+  one - shown on the Integrations page as a "Discovered" card with
+  Configure/Ignore buttons, same pattern as HomeKit Controller/Tapo/Hue.
+  "Ignore" needs no custom code - HA's `ConfigFlow` base class handles it
+  generically for any discovery-sourced flow.
+- Clicking "Configure" resumes straight into the same profile-review step
+  as before (auto-detected from the device's real DP schema, always
+  editable) - no functional change there, just how you get to it.
+- Dedup relies on `async_set_unique_id()`'s own built-in
+  already-in-progress abort - polling every 5 minutes does not spam
+  duplicate cards for a device the user hasn't acted on yet.
+- New `discovery_ip` step: if a cloud-known device isn't currently seen on
+  the LAN broadcast (offline, different VLAN, whatever), the discovery
+  flow now asks for a static IP instead of just failing - previously this
+  was a hard error with no recovery path in the flow itself.
+- New guard: a discovered device broadcasting protocol 3.4/3.5 now aborts
+  cleanly (`unsupported_protocol_version`) instead of silently creating a
+  ConfigEntry that's guaranteed to fail at setup (protocol 3.4/3.5 isn't
+  implemented - see known limitations).
+- The "manual" (no-cloud, single device) path is unchanged and still
+  available from the initial menu, for devices you don't want to route
+  through cloud discovery.
+- Also fixed while touching this: LAN broadcast's own reported protocol
+  version (`3.1`/`3.3`) is now actually used for discovered devices
+  instead of always defaulting to `3.3`.
+
 ## v0.1.1 - first live bug report, discovery port conflict
 
 - **Fixed**: `discover_devices()` failed to bind UDP ports 6666/6667

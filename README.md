@@ -111,40 +111,56 @@ on-off/modo/setpoint/temp actual/velocidad de ventilador/preset),
 `profile.py` (`ClimateMapping`/`VacuumMapping`/`LightMapping`) para el
 detalle de campos de cada bloque.
 
-## Cómo se obtiene el `local_key`
+## Alta: cuenta primero, dispositivos aparecen solos (como HomeKit/Tapo)
 
-Tuya no expone el `local_key` de fábrica por ningún medio LAN — solo vía su
-API de nube, una sola vez. El flujo de configuración ofrece dos caminos:
+1. **Ajustes → Dispositivos y servicios → Agregar integración → "Tuya
+   Orchestrator" → "Configurar una cuenta de Tuya Cloud"**: pedís Access
+   ID/Secret + UID de un proyecto "Cloud" gratuito en
+   [iot.tuya.com](https://iot.tuya.com) (vinculás tu cuenta de la app
+   Tuya/Smart Life en `Cloud > Devices > Link Tuya App Account` — ahí
+   también ves el UID). Esto crea **una sola** entrada de cuenta, sin
+   ningún dispositivo todavía.
+2. En segundo plano, esa cuenta sondea la nube + LAN cada 5 minutos (y una
+   vez al arrancar) y por cada dispositivo nuevo dispara un flujo de
+   descubrimiento nativo de HA — aparece como tarjeta **"Descubierto"** en
+   Ajustes → Dispositivos y servicios, una por dispositivo.
+3. **"Configurar"** en esa tarjeta te lleva directo al paso de perfil
+   (auto-detectado desde el schema real del dispositivo, siempre
+   editable). **"Ignorar"** lo maneja HA solo, sin nada de código nuestro.
+   Si el dispositivo no aparece todavía en la LAN (offline, otra VLAN),
+   pide la IP a mano en vez de fallar sin más.
 
-1. **Vía Tuya Cloud (recomendado)**: creás un proyecto "Cloud" gratuito en
-   [iot.tuya.com](https://iot.tuya.com), vinculás tu cuenta de la app
-   Tuya/Smart Life (`Cloud > Devices > Link Tuya App Account` — ahí también
-   ves el UID), y le pasás Access ID/Secret + UID al wizard. Se usa
-   **una sola vez**, solo para leer los `local_key`; nunca se vuelve a
-   llamar a la nube durante la operación normal.
-2. **Manual**: si ya conocés IP, `device_id` y `local_key` (por ejemplo
-   vía `tinytuya wizard`), los pegás directo.
+El Access ID/Secret/UID de la cuenta se usa solo para leer `local_key` y
+el schema de DPs de cada dispositivo — la operación normal, una vez
+configurado, es 100% LAN, nunca vuelve a llamar a la nube.
 
-Después de la extracción, el descubrimiento LAN (broadcast UDP puertos
-6666/6667) resuelve automáticamente la IP actual del dispositivo.
+**Alternativa sin nube**: "Agregar un solo dispositivo manualmente" en el
+mismo menú inicial, si ya conocés IP/`device_id`/`local_key` (por ejemplo
+vía `tinytuya wizard`) y no querés pasar por el descubrimiento.
 
-## Estado actual (v0.1.0)
+## Estado actual (v0.2.0)
 
 - ✅ Protocolo LAN implementado directamente (framing + AES-ECB), versiones
   **3.1 y 3.3**.
 - ❌ **3.4/3.5 (handshake HMAC de sesión) todavía no implementado** — la
-  mayoría de dispositivos Tuya fabricados desde ~2022 usan 3.4/3.5. Si tu
-  dispositivo es de esa generación, todavía no vas a poder usarlo — lanza
-  `NotImplementedError` explícito en vez de fallar en silencio.
-- ✅ Plataformas: `switch`, `sensor`, `number`, `binary_sensor`, `select`.
-- ❌ `light`/`climate`/`cover` no implementados aún (agregar cuando un
-  perfil real los necesite).
+  mayoría de dispositivos Tuya fabricados desde ~2022 usan 3.4/3.5. Un
+  dispositivo descubierto con esa versión aborta el alta con un mensaje
+  claro en vez de crear una entrada rota.
+- ✅ Plataformas: `switch`, `sensor`, `number`, `binary_sensor`, `select`,
+  `light` (brillo + temperatura de color + HSV, sin RGB por JSON en LAN
+  aún sin verificar), `climate`, `vacuum`.
+- ✅ Perfiles **auto-generados** desde el schema real de Tuya Cloud en el
+  alta (ver sección de arriba) — no hace falta escribirlos a mano.
+- ✅ Descubrimiento automático de dispositivos vía cuenta Tuya Cloud
+  (tarjetas Configurar/Ignorar), con fallback a IP manual si el
+  dispositivo no aparece en LAN.
 - ✅ Actualizaciones reactivas (push del propio socket LAN), no solo
   polling.
-- ⚠️ **Nunca probado contra una instancia real de Home Assistant ni un
-  dispositivo Tuya real** — scaffold inicial, verificado solo por
-  `py_compile` y revisión manual contra las APIs documentadas de HA y
-  Tuya. Reportá cualquier error real con el traceback completo.
+- ⚠️ **Nunca probado contra una instancia real de Home Assistant** más
+  allá del primer reporte de bug en vivo (conflicto de puerto UDP,
+  corregido en v0.1.1) — seguí reportando cualquier error con el
+  traceback completo, en particular sobre el flujo de descubrimiento
+  nuevo (v0.2.0), que todavía no tiene un solo reporte de uso real.
 
 Ver [CHANGELOG.md](CHANGELOG.md) para el detalle versión por versión.
 
@@ -173,8 +189,12 @@ endpoint más nuevo **v2.0 "Thing Data Model"**
 legacy solo publican su definición ahí. Si armás un perfil nuevo a mano y
 el endpoint `specification` te falla, probá ese antes de rendirte.
 
-**Limitación restante:** color RGB en luces (solo brillo + temperatura de
-color por ahora, ver `tuya_light_rgbcw.yaml`).
+**Limitación restante:** el color HSV de las luces (`tuya_light_rgbcw.yaml`)
+está implementado (modo blanco + modo color con brillo incluido en el
+propio JSON), verificado contra los valores reales de un dispositivo vía
+Tuya Cloud, pero el formato exacto que espera el DP por **LAN** (objeto
+JSON anidado vs. string JSON-encoded) no está confirmado contra un
+dispositivo real — ver el caveat en `profile.py` (`LightMapping`).
 
 ## Instalación (HACS, repositorio personalizado)
 

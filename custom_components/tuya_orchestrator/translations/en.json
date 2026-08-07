@@ -2,15 +2,15 @@
   "config": {
     "step": {
       "user": {
-        "title": "Add a Tuya device",
+        "title": "Add Tuya Orchestrator",
         "menu_options": {
-          "cloud": "Fetch local_key via Tuya Cloud (recommended)",
-          "manual": "Enter IP / device_id / local_key manually"
+          "account": "Set up a Tuya Cloud account (recommended - auto-discovers devices)",
+          "manual": "Add a single device manually (no cloud, no discovery)"
         }
       },
-      "cloud": {
+      "account": {
         "title": "Tuya Cloud project credentials",
-        "description": "From your Tuya IoT Platform project (Cloud > Devices > Link Tuya App Account for the UID). Used once, only to fetch local_keys.",
+        "description": "From your Tuya IoT Platform project (Cloud > Devices > Link Tuya App Account for the UID). Used only to fetch local_keys and DP schemas - once set up, devices you find on this account appear as \"Discovered\" cards below, one per device.",
         "data": {
           "region": "Region",
           "access_id": "Access ID / Client ID",
@@ -18,9 +18,13 @@
           "uid": "Linked app account UID"
         }
       },
-      "pick_cloud_device": {
-        "title": "Choose a device",
-        "data": { "device_id": "Device" }
+      "integration_discovery": {
+        "title": "New Tuya device found: {name}"
+      },
+      "discovery_ip": {
+        "title": "{name}: not currently seen on the LAN",
+        "description": "This device is known via your Tuya Cloud account but wasn't seen in a broadcast pass just now - make sure it's powered on and on the same network/VLAN, or enter its IP manually.",
+        "data": { "address": "IP address" }
       },
       "manual": {
         "title": "Manual device entry",
@@ -33,10 +37,10 @@
       },
       "profile": {
         "title": "Device profile",
-        "description": "Pick a built-in profile or paste your own YAML describing this device's datapoints.",
+        "description": "Auto-detected from the device's real DP schema when available (always review before saving) - or pick a built-in profile / paste your own YAML.",
         "data": {
           "profile_choice": "Profile",
-          "profile_yaml": "Custom profile YAML"
+          "profile_yaml": "Profile YAML"
         }
       }
     },
@@ -44,8 +48,12 @@
       "invalid_auth": "Invalid Tuya Cloud credentials.",
       "cannot_connect": "Could not reach the Tuya Cloud API.",
       "no_devices_found": "No devices found for that linked account (UID).",
-      "not_found_on_lan": "Device not seen on the LAN broadcast yet - make sure it's powered on and on the same network/VLAN, then retry.",
       "invalid_profile": "Invalid profile YAML."
+    },
+    "abort": {
+      "already_configured": "This device (or account) is already configured.",
+      "already_in_progress": "This device is already waiting to be configured - check your Discovered devices list.",
+      "unsupported_protocol_version": "This device uses Tuya protocol 3.4/3.5, not implemented yet - see the project README/CHANGELOG for status."
     }
   },
   "options": {
@@ -57,6 +65,9 @@
           "scan_interval": "Fallback poll interval (seconds)"
         }
       }
+    },
+    "abort": {
+      "account_entry_no_options": "Account entries have nothing to configure here - remove and re-add to change credentials."
     }
   }
 }

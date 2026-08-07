@@ -14,6 +14,15 @@ CONF_PROFILE_NAME = "profile_name"
 CONF_PROFILE_YAML = "profile_yaml"
 CONF_SCAN_INTERVAL = "scan_interval"
 
+# Distinguishes the two kinds of ConfigEntry this integration creates: one
+# "account" entry (Tuya Cloud credentials, no device of its own - runs a
+# background poller that triggers a discovery flow per device found) and
+# one "device" entry per paired device (the actual LAN-connected entity).
+CONF_ENTRY_TYPE = "entry_type"
+ENTRY_TYPE_ACCOUNT = "account"
+ENTRY_TYPE_DEVICE = "device"
+CONF_ACCOUNT_ENTRY_ID = "account_entry_id"  # stashed on discovery_info to trace back to its account
+
 # Cloud linking (used only during config_flow to fetch local_keys; never
 # stored/used again after setup - the running integration is 100% LAN).
 CONF_REGION = "region"
@@ -45,6 +54,7 @@ UDP_PORT_UNENCRYPTED = 6666
 UDP_PORT_ENCRYPTED = 6667
 UDP_KEY_ENCRYPTED = b"yGAdlopoPVLdABfn"  # fixed, published broadcast key
 DISCOVERY_TIMEOUT = 8
+DISCOVERY_POLL_INTERVAL = 300  # seconds; how often an "account" entry re-scans for new devices
 
 # ---------------------------------------------------------------------------
 # Profile / entity mapping

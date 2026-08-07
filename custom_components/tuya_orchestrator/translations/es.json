@@ -2,15 +2,15 @@
   "config": {
     "step": {
       "user": {
-        "title": "Agregar un dispositivo Tuya",
+        "title": "Agregar Tuya Orchestrator",
         "menu_options": {
-          "cloud": "Obtener local_key vía Tuya Cloud (recomendado)",
-          "manual": "Ingresar IP / device_id / local_key manualmente"
+          "account": "Configurar una cuenta de Tuya Cloud (recomendado - descubre dispositivos solo)",
+          "manual": "Agregar un solo dispositivo manualmente (sin nube, sin descubrimiento)"
         }
       },
-      "cloud": {
+      "account": {
         "title": "Credenciales del proyecto Tuya Cloud",
-        "description": "De tu proyecto en Tuya IoT Platform (Cloud > Devices > Link Tuya App Account para el UID). Se usa una sola vez, solo para obtener los local_keys.",
+        "description": "De tu proyecto en Tuya IoT Platform (Cloud > Devices > Link Tuya App Account para el UID). Se usa solo para obtener local_keys y schemas de DPs - una vez configurada, los dispositivos de esta cuenta van a aparecer como tarjetas \"Descubierto\", una por dispositivo.",
         "data": {
           "region": "Región",
           "access_id": "Access ID / Client ID",
@@ -18,9 +18,15 @@
           "uid": "UID de la cuenta de app vinculada"
         }
       },
-      "pick_cloud_device": {
-        "title": "Elegí un dispositivo",
-        "data": { "device_id": "Dispositivo" }
+      "integration_discovery": {
+        "title": "Nuevo dispositivo Tuya encontrado: {name}"
+      },
+      "discovery_ip": {
+        "title": "{name}: no visto actualmente en la LAN",
+        "description": "Este dispositivo se conoce vía tu cuenta de Tuya Cloud pero no apareció en un sondeo de broadcast recién - asegurate de que esté encendido y en la misma red/VLAN, o ingresá su IP manualmente.",
+        "data": {
+          "address": "Dirección IP"
+        }
       },
       "manual": {
         "title": "Alta manual",
@@ -33,10 +39,10 @@
       },
       "profile": {
         "title": "Perfil del dispositivo",
-        "description": "Elegí un perfil incluido o pegá tu propio YAML describiendo los datapoints del dispositivo.",
+        "description": "Auto-detectado desde el schema real de DPs del dispositivo cuando está disponible (siempre revisá antes de guardar) - o elegí un perfil incluido / pegá tu propio YAML.",
         "data": {
           "profile_choice": "Perfil",
-          "profile_yaml": "YAML de perfil personalizado"
+          "profile_yaml": "YAML de perfil"
         }
       }
     },
@@ -44,8 +50,12 @@
       "invalid_auth": "Credenciales de Tuya Cloud inválidas.",
       "cannot_connect": "No se pudo contactar a la API de Tuya Cloud.",
       "no_devices_found": "No se encontraron dispositivos para esa cuenta vinculada (UID).",
-      "not_found_on_lan": "El dispositivo aún no aparece en la red LAN - asegurate de que esté encendido y en la misma red/VLAN, y reintentá.",
       "invalid_profile": "YAML de perfil inválido."
+    },
+    "abort": {
+      "already_configured": "Este dispositivo (o cuenta) ya está configurado.",
+      "already_in_progress": "Este dispositivo ya está esperando ser configurado - revisá tu lista de dispositivos descubiertos.",
+      "unsupported_protocol_version": "Este dispositivo usa protocolo Tuya 3.4/3.5, todavía no implementado - ver el README/CHANGELOG del proyecto para el estado."
     }
   },
   "options": {
@@ -57,6 +67,9 @@
           "scan_interval": "Intervalo de sondeo de respaldo (segundos)"
         }
       }
+    },
+    "abort": {
+      "account_entry_no_options": "Las entradas de cuenta no tienen nada que configurar acá - eliminá y volvé a agregar para cambiar las credenciales."
     }
   }
 }

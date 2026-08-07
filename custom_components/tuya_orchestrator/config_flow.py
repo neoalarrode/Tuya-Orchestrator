@@ -1,7 +1,15 @@
-"""Config flow: cloud login (local_key extraction only) -> LAN discovery ->
-device pick -> profile pick/edit -> done. Everything after setup runs 100%
-on LAN; the cloud step's only job is fetching each device's local_key,
-which Tuya does not expose any other (documented) way.
+"""Config flow: two entry points.
+
+- "account" (recommended): Tuya Cloud credentials only. Creates one
+  ConfigEntry with no device of its own - its background poller
+  (account.py) then offers every device it finds as a native HA discovery
+  flow (`async_step_integration_discovery` below), shown as a
+  "Discovered" card with Configure/Ignore, same UX as HomeKit Controller
+  or Tapo. Clicking Configure resumes straight into the same profile
+  review step as before (auto-generated from the device's real DP schema,
+  always editable, never created blind).
+- "manual": a single device, no cloud, no discovery - IP/device_id/
+  local_key entered by hand, same as always.
 """
 from __future__ import annotations
 
@@ -17,10 +25,13 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import selector
 
+from .auto_profile import build_profile_from_schema
 from .const import (
     CONF_ACCESS_ID,
     CONF_ACCESS_SECRET,
+    CONF_ACCOUNT_ENTRY_ID,
     CONF_DEVICE_ID,
+    CONF_ENTRY_TYPE,
     CONF_LOCAL_KEY,
     CONF_PROFILE_YAML,
     CONF_PROTOCOL_VERSION,
@@ -30,10 +41,11 @@ from .const import (
     DEFAULT_PROTOCOL_VERSION,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    ENTRY_TYPE_ACCOUNT,
+    ENTRY_TYPE_DEVICE,
     SUPPORTED_PROTOCOL_VERSIONS,
     TUYA_REGIONS,
 )
-from .auto_profile import build_profile_from_schema
 from .discovery import discover_devices
 from .profile import DeviceProfile, parse_profile, profile_to_yaml
 from .tuya_cloud import TuyaCloudApi, TuyaCloudAuthError, TuyaCloudApiError
@@ -67,19 +79,18 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     def __init__(self) -> None:
-        self._cloud_devices: list[dict[str, Any]] = []
-        self._discovered: dict[str, Any] = {}
         self._chosen_device: dict[str, Any] | None = None
         self._chosen_ip: str | None = None
         self._auto_profile_yaml: str | None = None
         self._cloud_api: TuyaCloudApi | None = None
+        self._manual_protocol: str = DEFAULT_PROTOCOL_VERSION
 
-    # -- step 1: how do we get the local_key? --------------------------------
+    # -- step 1: account (recommended) vs fully manual single device --------
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        return self.async_show_menu(step_id="user", menu_options=["cloud", "manual"])
+        return self.async_show_menu(step_id="user", menu_options=["account", "manual"])
 
-    # -- step 2a: cloud credentials (only used to fetch local_keys) ----------
-    async def async_step_cloud(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    # -- account setup: cloud credentials only, no device picked here -------
+    async def async_step_account(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
             session = async_get_clientsession(self.hass)
@@ -91,18 +102,21 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
             try:
                 await api.validate()
-                self._cloud_devices = await api.get_user_devices(user_input[CONF_UID])
-                self._cloud_api = api
+                devices = await api.get_user_devices(user_input[CONF_UID])
             except TuyaCloudAuthError:
                 errors["base"] = "invalid_auth"
             except (TuyaCloudApiError, aiohttp.ClientError):
                 errors["base"] = "cannot_connect"
             else:
-                if not self._cloud_devices:
+                if not devices:
                     errors["base"] = "no_devices_found"
                 else:
-                    self._cloud_creds = user_input
-                    return await self.async_step_pick_cloud_device()
+                    await self.async_set_unique_id(f"account_{user_input[CONF_ACCESS_ID]}")
+                    self._abort_if_unique_id_configured()
+                    return self.async_create_entry(
+                        title=f"Tuya Cloud ({user_input[CONF_UID]})",
+                        data={CONF_ENTRY_TYPE: ENTRY_TYPE_ACCOUNT, **user_input},
+                    )
 
         schema = vol.Schema(
             {
@@ -112,26 +126,63 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_UID): str,
             }
         )
-        return self.async_show_form(step_id="cloud", data_schema=schema, errors=errors)
+        return self.async_show_form(step_id="account", data_schema=schema, errors=errors)
 
-    async def async_step_pick_cloud_device(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    # -- entry point the account's background poller triggers per device ----
+    async def async_step_integration_discovery(self, discovery_info: dict[str, Any]) -> FlowResult:
+        device_id = discovery_info["device_id"]
+        await self.async_set_unique_id(device_id)
+        self._abort_if_unique_id_configured()
+
+        self._chosen_device = discovery_info
+        self._chosen_ip = discovery_info.get("ip")
+        self.context["title_placeholders"] = {"name": discovery_info.get("name", device_id)}
+
+        version = discovery_info.get("version")
+        if self._chosen_ip is None:
+            # Not seen in the account poller's last LAN pass - try once more,
+            # right now, before giving up and asking the user for a static IP.
+            found = (await discover_devices()).get(device_id)
+            self._chosen_ip = found.ip if found else None
+            version = found.version if found else version
+        if version and version not in ("3.1", "3.3"):
+            # Protocol 3.4/3.5 isn't implemented yet (see tuya_lan.py) -
+            # abort here with a clear reason instead of creating an entry
+            # that's guaranteed to fail at setup.
+            return self.async_abort(reason="unsupported_protocol_version")
+        if version in SUPPORTED_PROTOCOL_VERSIONS:
+            self._manual_protocol = version
+
+        account_entry = self.hass.config_entries.async_get_entry(discovery_info.get(CONF_ACCOUNT_ENTRY_ID))
+        if account_entry is not None:
+            session = async_get_clientsession(self.hass)
+            self._cloud_api = TuyaCloudApi(
+                session,
+                account_entry.data[CONF_REGION],
+                account_entry.data[CONF_ACCESS_ID],
+                account_entry.data[CONF_ACCESS_SECRET],
+            )
+            await self._build_auto_profile()
+
+        if self._chosen_ip is None:
+            return await self.async_step_discovery_ip()
+        return await self.async_step_profile()
+
+    async def async_step_discovery_ip(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Device known via cloud but not currently seen on the LAN broadcast -
+        ask for a static IP rather than blocking the whole discovery card."""
         errors: dict[str, str] = {}
-        options = {d["device_id"]: f"{d['name']} ({d['device_id']})" for d in self._cloud_devices}
-
         if user_input is not None:
-            device_id = user_input[CONF_DEVICE_ID]
-            self._chosen_device = next(d for d in self._cloud_devices if d["device_id"] == device_id)
-            self._discovered = await discover_devices()
-            found = self._discovered.get(device_id)
-            if not found:
-                errors["base"] = "not_found_on_lan"
-            else:
-                self._chosen_ip = found.ip
-                await self._build_auto_profile()
-                return await self.async_step_profile()
+            self._chosen_ip = user_input["address"]
+            return await self.async_step_profile()
 
-        schema = vol.Schema({vol.Required(CONF_DEVICE_ID): vol.In(options)})
-        return self.async_show_form(step_id="pick_cloud_device", data_schema=schema, errors=errors)
+        schema = vol.Schema({vol.Required("address"): str})
+        return self.async_show_form(
+            step_id="discovery_ip",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={"name": self._chosen_device.get("name", "")},
+        )
 
     async def _build_auto_profile(self) -> None:
         """Fetch this device's real DP schema from the cloud (code + dp_id +
@@ -162,10 +213,12 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception as err:  # noqa: BLE001 - best-effort, never block onboarding
             _LOGGER.warning("Auto-profile generation failed for %s: %s", self._chosen_device["device_id"], err)
 
-    # -- step 2b: fully manual (IP + device id + local_key already known) ----
+    # -- fully manual (IP + device id + local_key already known, no cloud) --
     async def async_step_manual(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
+            await self.async_set_unique_id(user_input[CONF_DEVICE_ID])
+            self._abort_if_unique_id_configured()
             self._chosen_device = {
                 "device_id": user_input[CONF_DEVICE_ID],
                 "local_key": user_input[CONF_LOCAL_KEY],
@@ -188,8 +241,7 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="manual", data_schema=schema, errors=errors)
 
-    # -- step 3: review the auto-detected profile, or pick a built-in / -----
-    #    paste a custom one instead ------------------------------------------
+    # -- review the auto-detected profile, or pick a built-in / paste one ---
     async def async_step_profile(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
         profiles = _builtin_profiles()
@@ -235,10 +287,11 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _create_entry(self, profile_yaml: str) -> FlowResult:
         device = self._chosen_device
         data = {
+            CONF_ENTRY_TYPE: ENTRY_TYPE_DEVICE,
             CONF_DEVICE_ID: device["device_id"],
             CONF_LOCAL_KEY: device.get("local_key"),
             "address": self._chosen_ip,
-            CONF_PROTOCOL_VERSION: getattr(self, "_manual_protocol", DEFAULT_PROTOCOL_VERSION),
+            CONF_PROTOCOL_VERSION: self._manual_protocol,
             CONF_PROFILE_YAML: profile_yaml,
         }
         return self.async_create_entry(title=device["name"], data=data)
@@ -250,9 +303,14 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class TuyaOrchestratorOptionsFlow(config_entries.OptionsFlow):
-    """Edit the device's profile or polling fallback interval after setup."""
+    """Edit a device entry's profile or polling fallback interval after
+    setup. Not shown for "account" entries - nothing to configure there
+    beyond re-adding it (delete + re-add if credentials change)."""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        if self.config_entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_ACCOUNT:
+            return self.async_abort(reason="account_entry_no_options")
+
         current_yaml = self.config_entry.data.get(CONF_PROFILE_YAML, "")
         errors: dict[str, str] = {}
 
