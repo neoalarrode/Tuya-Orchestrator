@@ -66,15 +66,31 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
         lan = await discover_devices()
         configured_ids = {e.unique_id for e in hass.config_entries.async_entries(DOMAIN) if e.unique_id}
+        _LOGGER.debug(
+            "Tuya account %s: %s device(s) on cloud, %s seen on LAN broadcast (%s), "
+            "%s already configured/ignored (%s)",
+            entry.title,
+            len(devices),
+            len(lan),
+            sorted(lan.keys()),
+            len(configured_ids),
+            sorted(configured_ids),
+        )
 
         new_count = 0
         for device in devices:
             device_id = device["device_id"]
             if device_id in configured_ids:
+                _LOGGER.debug("Skipping %s (%s): already configured/ignored", device["name"], device_id)
                 continue
             found = lan.get(device_id)
             if found is None:
-                continue  # not seen on this LAN right now - don't offer it
+                _LOGGER.debug(
+                    "Skipping %s (%s): known via cloud but not seen on this LAN broadcast pass",
+                    device["name"],
+                    device_id,
+                )
+                continue
             await hass.config_entries.flow.async_init(
                 DOMAIN,
                 context={"source": SOURCE_INTEGRATION_DISCOVERY},

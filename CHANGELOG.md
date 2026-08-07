@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.8 - bit-packed DP support (display light/buzzer), discovery diagnostics
+
+- **New: `DPMapping.bit` for bit-packed DPs.** Some Tuya devices (this
+  AC included) pack several unrelated booleans into ONE hex-encoded
+  multi-byte string DP instead of giving each its own (Tuya's own field
+  description for this AC's `boolCode`, dp 123: byte 0 bit3 = display
+  light, bit4 = buzzer, among others). `platform: switch`/`binary_sensor`
+  entries can now set `bit: N` (a flat bit index across the byte array)
+  instead of treating the DP as a plain bool. Writing does a real
+  read-modify-write against the DP's CURRENT raw value so unrelated bits
+  in the same field are never clobbered - verified with a direct test:
+  toggling one bit on, then another, then the first back off, correctly
+  leaves the untouched bit alone throughout. `tuya_ac_basic.yaml` now
+  exposes "Display light" and "Buzzer" as two real switches from this
+  mechanism, documented as a worked example for adding more (eco mode,
+  health mode, etc. are the same bitfield, just unmapped).
+- **Discovery diagnostics.** After a report that devices known to be on
+  the LAN weren't appearing as "Discovered" cards, re-diffed
+  `discovery.py` against localtuya's real implementation line-by-line -
+  found no discrepancy this time (framing, key, and binding all already
+  matched). Since the mechanism itself checks out, added debug logging to
+  `account.py`'s poller (cloud device count, LAN-found count + IDs,
+  already-configured/ignored count, and a specific skip reason per
+  device) so the next report has real data instead of more guessing -
+  the two most likely explanations that AREN'T a code bug are (a) the
+  device already has a real or ignored ConfigEntry from earlier testing
+  this session, or (b) Home Assistant running in a container without
+  host networking (Docker bridge mode) never receives LAN broadcast
+  traffic at all - a very common, well-known gotcha for any broadcast-
+  based discovery (mDNS/SSDP/Tuya alike), not specific to this integration.
+
 ## v0.2.7 - fix: FUNDAMENTAL receive-parsing bug, every device reply was corrupt
 
 The real root cause behind "no puedo setear la temperatura" and "sigue

@@ -66,10 +66,21 @@ class DPMapping:
     max_value: float | None = None
     step: float | None = None
     icon: str | None = None
+    # `bit`: this DP's raw value is a hex-encoded multi-byte bitfield (some
+    # Tuya devices pack several unrelated booleans - e.g. display light,
+    # buzzer/beep, eco mode - into ONE string DP instead of giving each its
+    # own) rather than a plain bool/number/enum. `bit` is a flat index into
+    # that byte array (bit 0-7 = first byte, 8-15 = second byte, ...) -
+    # only meaningful on `platform: switch`/`binary_sensor`. See
+    # decode_bit()/encode_bit(); a real example is documented in
+    # profiles/tuya_ac_basic.yaml (display light / buzzer on a boolCode DP).
+    bit: int | None = None
 
     def decode(self, raw: Any) -> Any:
         if raw is None:
             return None
+        if self.bit is not None:
+            return self.decode_bit(raw)
         if self.value_map is not None:
             return self.value_map.get(raw, raw)
         if self.invert and isinstance(raw, bool):
@@ -82,6 +93,11 @@ class DPMapping:
         return raw
 
     def encode(self, value: Any) -> Any:
+        # NOTE: bit fields do NOT go through this method - encoding a
+        # single bit requires the DP's CURRENT raw value (to preserve the
+        # other, unrelated bits packed into the same field) which this
+        # stateless method has no access to. Callers use encode_bit()
+        # directly instead, passing the coordinator's current raw value.
         if self.value_map is not None:
             reverse = {v: k for k, v in self.value_map.items()}
             return reverse.get(value, value)
@@ -90,6 +106,40 @@ class DPMapping:
         if self.scale:
             return round(value * self.scale)
         return value
+
+    def decode_bit(self, raw: Any) -> bool | None:
+        """Read this mapping's single `bit` out of a hex-encoded bitfield
+        DP value. Missing/undersized data reads as False (bit not set),
+        not None - a packed boolean field's absence means "off", not
+        "unknown", matching how the device itself would report a
+        never-toggled byte."""
+        if self.bit is None or not raw:
+            return None
+        try:
+            data = bytes.fromhex(raw) if isinstance(raw, str) else bytes(raw)
+        except (ValueError, TypeError):
+            return None
+        byte_idx, bit_in_byte = divmod(self.bit, 8)
+        if byte_idx >= len(data):
+            return False
+        return bool((data[byte_idx] >> bit_in_byte) & 1)
+
+    def encode_bit(self, value: bool, current_raw: Any) -> str:
+        """Flip this mapping's single `bit` while preserving every other
+        bit already set in the field - a plain `encode(value)` can't do
+        this safely since it has no access to the field's current value."""
+        byte_idx, bit_in_byte = divmod(self.bit, 8)
+        try:
+            data = bytearray.fromhex(current_raw) if isinstance(current_raw, str) and current_raw else bytearray()
+        except ValueError:
+            data = bytearray()
+        if len(data) <= byte_idx:
+            data.extend(b"\x00" * (byte_idx + 1 - len(data)))
+        if value:
+            data[byte_idx] |= 1 << bit_in_byte
+        else:
+            data[byte_idx] &= ~(1 << bit_in_byte) & 0xFF
+        return data.hex()
 
 
 @dataclass
@@ -251,6 +301,7 @@ def parse_profile(yaml_text: str) -> DeviceProfile:
                 max_value=entry.get("max"),
                 step=entry.get("step"),
                 icon=entry.get("icon"),
+                bit=entry.get("bit"),
             )
         )
     lights = []
@@ -352,6 +403,7 @@ def profile_to_yaml(profile: DeviceProfile) -> str:
                     "max": d.max_value,
                     "step": d.step,
                     "icon": d.icon,
+                    "bit": d.bit,
                 }.items()
                 if v is not None
             }

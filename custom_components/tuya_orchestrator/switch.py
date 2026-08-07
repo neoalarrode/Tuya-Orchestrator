@@ -24,7 +24,19 @@ class TuyaSwitch(TuyaOrchestratorEntity, SwitchEntity):
         return self._mapping.decode(self._raw)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self.coordinator.async_set_dp(self._mapping.dp_id, self._mapping.encode(True))
+        await self._set(True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.coordinator.async_set_dp(self._mapping.dp_id, self._mapping.encode(False))
+        await self._set(False)
+
+    async def _set(self, value: bool) -> None:
+        m = self._mapping
+        if m.bit is not None:
+            # Bit-packed field (e.g. display light/buzzer sharing one DP
+            # with unrelated toggles) - needs the CURRENT raw value to
+            # preserve every other bit, a plain encode(value) can't do
+            # this safely. See DPMapping.encode_bit()'s docstring.
+            raw = m.encode_bit(value, self._raw)
+        else:
+            raw = m.encode(value)
+        await self.coordinator.async_set_dp(m.dp_id, raw)

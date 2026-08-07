@@ -2,8 +2,8 @@
 # (category "kt" - portable/split AC unit).
 #
 # Grouped into a real `climate.*` entity (thermostat card: mode/setpoint/
-# current temp/fan speed/humidity all in one) instead of separate switch +
-# number + select + sensor entities for the same handful of DPs.
+# current temp/fan speed/sleep preset/swing/humidity all in one) instead of
+# separate switch + number + select + sensor entities for the same DPs.
 #
 # RESOLVED CAVEAT: the raw cloud schema declares temp_set's max as 880
 # (-> 88.0 C after the scale divisor), implausible for a real AC setpoint.
@@ -15,13 +15,34 @@
 # the parallel Fahrenheit DP's max=88), not a real device limit - using 31
 # here instead, and saying so.
 #
-# Only the most commonly-used DPs are mapped. The full schema also exposes:
-# sleep mode, louver swing (up/down, left/right), air quality, dirty
-# filter, energy counters - available if wanted, ask and they can be added.
+# `boolCode` (dp 123) is NOT a plain boolean despite the name - it's a
+# hex-encoded 2-BYTE BITFIELD packing several unrelated toggles into one
+# string DP (confirmed from Tuya's own field description). Exposed here as
+# two individual `bit:`-mapped switches (display light, buzzer); the rest
+# of that bitfield (eco, anti-mold dehumidify, evaporator self-clean,
+# health mode, light sensor, dry mode, 8C heating, filter detection,
+# soft wind...) is left unmapped - add more `bit:` entries the same way if
+# wanted, see DPMapping.decode_bit()/encode_bit() for how it works.
+#
+# Air quality, dirty filter, energy counters, and the second swing axis
+# (left_right_sweep) aren't mapped here either - auto-detection picks all
+# of this up automatically at pairing time now (see auto_profile.py), this
+# hand-written profile only covers the commonly-used subset as a
+# reference/fallback for manual/offline setup.
 name: Tuya portable/split AC
 product_ids:
   - 4epook7bjtjzcxjb
-dps: []
+dps:
+  - id: 123
+    platform: switch
+    name: Display light
+    icon: mdi:television-ambient-light
+    bit: 3   # byte 0, bit 3 - "灯光" per Tuya's field description
+  - id: 123
+    platform: switch
+    name: Buzzer
+    icon: mdi:volume-high
+    bit: 4   # byte 0, bit 4 - "蜂鸣" per Tuya's field description
 climates:
   - name: AC
     icon: mdi:air-conditioner
@@ -49,4 +70,16 @@ climates:
       low: Low
       mute: Mute
       auto: Auto
+    preset_dp: 105
+    preset_map:
+      'off': 'Off'
+      normal: Normal
+      old: Elderly
+      child: Child
+    swing_dp: 113
+    swing_map:
+      '0': 'Off'
+      '1': Up-down
+      '2': Up only
+      '3': Down only
     humidity_dp: 18
