@@ -94,13 +94,23 @@ async def _sweep_open_hosts(subnet: ipaddress.IPv4Network, port: int) -> list[st
 async def _try_identify(ip: str, device_id: str, local_key: str) -> bool:
     device = TuyaLocalDevice(device_id, ip, local_key, protocol_version="3.3")
     try:
-        await asyncio.wait_for(device.connect(), timeout=IDENTIFY_TIMEOUT)
+        # retries=1: this is a quick probe against a possibly-wrong host,
+        # not the real pairing connection - fail fast here (connect()'s
+        # own retry/backoff, added after a live report, is for the real
+        # connect once a device is actually being paired, not for scanning).
+        await device.connect(timeout=IDENTIFY_TIMEOUT, retries=1)
         await asyncio.wait_for(device.status(), timeout=IDENTIFY_TIMEOUT)
         return True
     except Exception:  # noqa: BLE001 - wrong host/key/offline/anything - just not a match
         return False
     finally:
         await device.close()
+        # Brief cooldown before this host might get probed again with a
+        # different candidate key, or before the real pairing connect()
+        # happens shortly after a match - cheap embedded devices can need
+        # a moment to release a just-closed connection (see connect()'s
+        # retry/backoff docstring for the live report this came from).
+        await asyncio.sleep(0.3)
 
 
 async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, str]:

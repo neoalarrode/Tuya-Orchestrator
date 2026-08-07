@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.4.1 - fix: ConnectionResetError on a fresh connect to a just-discovered device
+
+Live report: pairing "WiFi Watering Pump 2" (found via v0.4.0's active
+scan) failed at `device.connect()` with
+`ConnectionResetError: [Errno 104] Connect call failed`. Unlike the
+earlier "Connection lost" bugs (all real protocol/framing mistakes, fixed
+in v0.2.4-v0.3.2), this is a fresh TCP connect being reset outright by
+the remote before any protocol exchange even starts - not a decode/field
+bug, a connection-establishment one. Cheap embedded Tuya devices commonly
+have a very limited TCP stack and can reject a new connection for a
+short cooldown right after a previous one closed - plausible here since
+active_scan.py's own identify probe connects+closes a connection to the
+SAME device to positively identify it, shortly before the real pairing
+connect happens.
+
+Fixed with what's the standard, defensive answer to exactly this class of
+flaky embedded-device behavior (not a protocol mistake to "solve" -
+there's nothing to decode differently): `TuyaLocalDevice.connect()` now
+retries up to 3 times with a short increasing backoff (0.5s, 1.0s) on
+`ConnectionResetError`/`OSError`/timeout before giving up. `active_scan.py`'s
+own probe connect uses `retries=1` (a quick fail-fast check against a
+possibly-wrong host, not the real pairing connection) and now waits
+0.3s after closing each probe before moving on, reducing the chance of
+tripping this in the first place. Verified with a direct test: first
+connect attempt raises `ConnectionResetError`, second succeeds, `connect()`
+transparently retries and returns normally.
+
 ## v0.4.0 - active LAN scan fallback (for devices that don't broadcast)
 
 Requested after confirming specific device categories (relay-based

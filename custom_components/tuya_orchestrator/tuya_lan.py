@@ -125,10 +125,42 @@ class TuyaLocalDevice:
         self._lock = asyncio.Lock()
 
     # -- connection lifecycle -------------------------------------------------
-    async def connect(self, timeout: float = 5.0) -> None:
-        self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(self.address, self.port), timeout=timeout
-        )
+    async def connect(self, timeout: float = 5.0, retries: int = 3) -> None:
+        # Real report: a fresh connect() to a just-discovered device (an
+        # irrigation valve, found seconds earlier by active_scan.py's own
+        # identify step) failed outright with ConnectionResetError. Cheap
+        # embedded Tuya devices commonly have a very limited TCP stack and
+        # can reject/reset a new connection attempt for a short cooldown
+        # right after a previous one closed - plausible here since
+        # active_scan.py connects+closes its own probe connection to the
+        # same device shortly before the real pairing connect happens.
+        # Retrying with a short backoff is standard, defensive handling
+        # for exactly this kind of flaky embedded-device behavior, not a
+        # protocol bug to "fix" - there's nothing wrong to decode/encode
+        # differently here.
+        last_err: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.address, self.port), timeout=timeout
+                )
+                break
+            except (ConnectionResetError, OSError, asyncio.TimeoutError) as err:
+                last_err = err
+                if attempt == retries:
+                    raise
+                delay = 0.5 * attempt
+                _LOGGER.debug(
+                    "%s: connect attempt %d/%d failed (%s), retrying in %.1fs",
+                    self.device_id,
+                    attempt,
+                    retries,
+                    err,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        else:  # pragma: no cover - defensive, loop always breaks or raises
+            raise last_err
         self._listen_task = asyncio.ensure_future(self._listen())
         # GAP FIXED HERE (found reviewing localtuya's pytuya/__init__.py's
         # TuyaProtocol.start_heartbeat()): without a periodic HEART_BEAT,
