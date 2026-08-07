@@ -1,0 +1,24 @@
+# Matches: "Escritorio no tocar" / "Mesilla" (category "cz", no energy
+# monitoring on this particular model).
+name: Tuya smart plug (basic, no energy monitoring)
+product_ids:
+  - 7cn6ltvjwj5puzti
+dps:
+  - id: 1
+    platform: switch
+    name: Power
+    icon: mdi:power-plug
+  - id: 9
+    platform: number
+    name: Countdown
+    unit: s
+    min: 0
+    max: 86400
+    step: 1
+  - id: 38
+    platform: select
+    name: Power-on behavior
+    map:
+      power_off: "Off"
+      power_on: "On"
+      last: "Restore last state"

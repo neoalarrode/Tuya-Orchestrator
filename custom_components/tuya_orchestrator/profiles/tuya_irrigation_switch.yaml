@@ -1,0 +1,9 @@
+# Matches: WiFi Watering Pump 2 / Sombrilla (category "ggq" - irrigation).
+name: Tuya irrigation valve / pump (simple on-off)
+product_ids:
+  - uabva2zng0w1jmna
+dps:
+  - id: 1
+    platform: switch
+    name: Power
+    icon: mdi:water-pump

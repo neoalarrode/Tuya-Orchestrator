@@ -1,0 +1,36 @@
+# Matches: "Baño 1", "Baño 2", "MR16 GU5.3 4", "Pasillo abajo" (category
+# "dj" - RGBCW bulb/spot). Dual-mode: `work_mode` (DP 21) picks white
+# (brightness DP 22 + color temp DP 23) vs colour (single JSON HSV DP 24,
+# which ALSO carries brightness via its "v" field) - verified live against
+# a real device via Tuya Cloud, not guessed. See light.py/profile.py
+# LightMapping docstring for the one remaining unverified point: whether
+# the LOCAL (LAN) wire format for DP 24 matches the cloud's JSON-string
+# representation exactly.
+name: Tuya RGBCW light
+product_ids:
+  - eznpgkub8wsak043
+dps:
+  - id: 26
+    platform: number
+    name: Countdown
+    unit: s
+    min: 0
+    max: 86400
+    step: 1
+lights:
+  - name: Light
+    icon: mdi:lightbulb
+    switch_dp: 20
+    work_mode_dp: 21
+    work_mode_white: white
+    work_mode_colour: colour
+    brightness_dp: 22
+    brightness_min: 10
+    brightness_max: 1000
+    color_temp_dp: 23
+    color_temp_min: 0
+    color_temp_max: 1000
+    color_dp: 24
+    color_h_max: 360
+    color_s_max: 1000
+    color_v_max: 1000

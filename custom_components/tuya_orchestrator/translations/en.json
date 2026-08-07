@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Tuya device",
+        "menu_options": {
+          "cloud": "Fetch local_key via Tuya Cloud (recommended)",
+          "manual": "Enter IP / device_id / local_key manually"
+        }
+      },
+      "cloud": {
+        "title": "Tuya Cloud project credentials",
+        "description": "From your Tuya IoT Platform project (Cloud > Devices > Link Tuya App Account for the UID). Used once, only to fetch local_keys.",
+        "data": {
+          "region": "Region",
+          "access_id": "Access ID / Client ID",
+          "access_secret": "Access Secret / Client Secret",
+          "uid": "Linked app account UID"
+        }
+      },
+      "pick_cloud_device": {
+        "title": "Choose a device",
+        "data": { "device_id": "Device" }
+      },
+      "manual": {
+        "title": "Manual device entry",
+        "data": {
+          "device_id": "Device ID",
+          "local_key": "Local key",
+          "address": "IP address",
+          "protocol_version": "Protocol version"
+        }
+      },
+      "profile": {
+        "title": "Device profile",
+        "description": "Pick a built-in profile or paste your own YAML describing this device's datapoints.",
+        "data": {
+          "profile_choice": "Profile",
+          "profile_yaml": "Custom profile YAML"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid Tuya Cloud credentials.",
+      "cannot_connect": "Could not reach the Tuya Cloud API.",
+      "no_devices_found": "No devices found for that linked account (UID).",
+      "not_found_on_lan": "Device not seen on the LAN broadcast yet - make sure it's powered on and on the same network/VLAN, then retry.",
+      "invalid_profile": "Invalid profile YAML."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Edit profile / polling interval",
+        "data": {
+          "profile_yaml": "Profile YAML",
+          "scan_interval": "Fallback poll interval (seconds)"
+        }
+      }
+    }
+  }
+}

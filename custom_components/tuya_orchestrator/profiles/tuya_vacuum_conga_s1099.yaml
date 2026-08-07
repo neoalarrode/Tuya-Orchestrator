@@ -1,0 +1,124 @@
+# Matches: "S1099" (category "sd", product_id j6wUila5MykirOYY, model
+# "Conga 1090/S1099"). Schema recovered via the v2.0 Thing Data Model
+# endpoint (see tuya_heater_readywarm.yaml for the same recovery story).
+#
+# No dedicated "return to dock" DP exists on this model (checked the full
+# schema - genuinely absent), so RETURN_HOME isn't offered here; unlike
+# tuya_vacuum_generic.yaml, start/pause share ONE enum DP (CleanSwtich)
+# rather than two separate booleans.
+#
+# CAVEAT: dp 108 (battery) is declared with scale=1 (divisor 10) in the
+# cloud model, but a live status read showed electricity_left=97 as an
+# already-plausible percentage - left WITHOUT a scale here since that's
+# what was actually observed; add `battery_scale: 10` back if your unit
+# turns out to need it. Documenting the conflict rather than guessing.
+name: Tuya robot vacuum - Conga 1090/S1099
+product_ids:
+  - j6wUila5MykirOYY
+dps:
+  - id: 1
+    platform: switch
+    name: Power
+    icon: mdi:power
+    # Distinct from start/pause (dp 112, handled by the vacuum entity
+    # below) - this is the robot's overall power, not the cleaning cycle.
+  - id: 14
+    platform: sensor
+    name: Clean area
+    unit: "m²"
+  - id: 17
+    platform: sensor
+    name: Fault code
+    # Raw bitmap, not decoded (FAULT_NONE = no fault).
+  - id: 102
+    platform: select
+    name: Clean mode
+    map:
+      clean_auto: Auto
+      clean_random: Random
+      clean_wall: Along wall
+      clean_spot: Spot
+      clean_sroom: Single room
+      find_sta: Find dock
+      "null": Idle
+  - id: 105
+    platform: select
+    name: Move direction
+    map:
+      MoveForward: Forward
+      MoveBackward: Backward
+      MoveLeft: Turn left
+      MoveRight: Turn right
+      stop: Stop
+  - id: 107
+    platform: sensor
+    name: Clean time
+    unit: min
+  - id: 109
+    platform: sensor
+    name: Side brush life
+    unit: "%"
+    icon: mdi:broom
+  - id: 110
+    platform: sensor
+    name: Roller brush life
+    unit: "%"
+    icon: mdi:broom
+  - id: 111
+    platform: sensor
+    name: HEPA filter life
+    unit: "%"
+    icon: mdi:air-filter
+  - id: 118
+    platform: sensor
+    name: Mop life
+    unit: "%"
+  - id: 113
+    platform: switch
+    name: Confirm side brush reset
+  - id: 115
+    platform: switch
+    name: Confirm HEPA filter reset
+  - id: 119
+    platform: switch
+    name: Confirm mop reset
+  - id: 117
+    platform: select
+    name: Water level
+    map:
+      LOW: Low
+      MEDIUM: Medium
+      HIGH: High
+      NONE: None
+      WATEROFF: Off
+  - id: 121
+    platform: binary_sensor
+    name: Water tank installed
+  - id: 122
+    platform: switch
+    name: Mop mode
+vacuums:
+  - name: Vacuum
+    start_dp: 112
+    start_map:
+      "1": start
+      "0": pause
+    locate_dp: 116
+    battery_dp: 108
+    status_dp: 101
+    status_map:
+      SLEEP: idle
+      HALTING: idle
+      CLEANING: cleaning
+      CLEAN_COMP: docked
+      FIND_STA: returning
+      CHARGING_STA: docked
+      CHARGING_DC: docked
+      CHARG_COMP: docked
+    fan_speed_dp: 104
+    fan_speed_map:
+      FANHALTING: Halting
+      FANNORAM: Normal
+      FANMAX: Max
+      NONE: None
+      FANOFF: Off

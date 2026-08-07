@@ -1,0 +1,228 @@
+"""Minimal local (LAN) Tuya protocol client.
+
+Implements the well-documented Tuya wire format directly (packet framing +
+AES payload encryption) instead of depending on a third-party Tuya SDK, so
+the whole DP <-> entity path stays inspectable end to end - no black box.
+
+Wire format (protocol versions 3.1/3.3), all fields big-endian:
+
+    0x000055AA | seq(4) | command(4) | length(4) | payload[...] | crc32(4) | 0x0000AA55
+
+`length` counts payload + crc32 + suffix (8 bytes). For protocol 3.3+ the
+payload is AES-128-ECB encrypted with the device's local_key (PKCS7 padded);
+for 3.1, DPS payloads are AES-encrypted then hex-encoded and wrapped with an
+MD5-based signature prefix. Protocol 3.4/3.5 additionally require a
+session-key handshake (HMAC-SHA256) before any DP exchange.
+
+Known limitation (documented on purpose, see project README): 3.4/3.5
+session-key handshake is NOT implemented yet - only 3.1 and 3.3 devices are
+supported in this version. Most Tuya LAN-capable devices manufactured before
+~2022 use 3.1/3.3. Attempting to use protocol_version="3.4" raises
+NotImplementedError with a clear message rather than failing silently.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import struct
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+
+_LOGGER = logging.getLogger(__name__)
+
+PREFIX = 0x000055AA
+SUFFIX = 0x0000AA55
+HEADER_SIZE = 16  # prefix+seq+command+length
+FOOTER_SIZE = 8  # crc32+suffix
+
+CMD_STATUS = 0x0A  # DP_QUERY
+CMD_CONTROL = 0x07  # CONTROL (set DPs)
+CMD_HEARTBEAT = 0x09
+
+
+def _crc32(data: bytes) -> int:
+    import binascii
+
+    return binascii.crc32(data) & 0xFFFFFFFF
+
+
+class TuyaProtocolError(Exception):
+    """Raised on malformed/undecryptable packets."""
+
+
+@dataclass
+class TuyaMessage:
+    seq: int
+    command: int
+    payload: dict[str, Any] | None
+
+
+class TuyaLocalDevice:
+    """A single persistent LAN connection to one Tuya device."""
+
+    def __init__(
+        self,
+        device_id: str,
+        address: str,
+        local_key: str,
+        protocol_version: str = "3.3",
+        port: int = 6668,
+        on_update: Callable[[dict[int, Any]], None] | None = None,
+    ) -> None:
+        if protocol_version not in ("3.1", "3.3"):
+            raise NotImplementedError(
+                f"Tuya protocol {protocol_version} is not implemented yet "
+                "(only 3.1 and 3.3 are supported in this version)."
+            )
+        self.device_id = device_id
+        self.address = address
+        self.local_key = local_key.encode("utf-8")
+        self.protocol_version = protocol_version
+        self.port = port
+        self._on_update = on_update
+        self._seq = 0
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._listen_task: asyncio.Task | None = None
+        self._pending: dict[int, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    # -- connection lifecycle -------------------------------------------------
+    async def connect(self, timeout: float = 5.0) -> None:
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_connection(self.address, self.port), timeout=timeout
+        )
+        self._listen_task = asyncio.ensure_future(self._listen())
+
+    async def close(self) -> None:
+        if self._listen_task:
+            self._listen_task.cancel()
+        if self._writer:
+            self._writer.close()
+
+    @property
+    def connected(self) -> bool:
+        return self._writer is not None and not self._writer.is_closing()
+
+    # -- public API -------------------------------------------------------------
+    async def status(self) -> dict[int, Any]:
+        """Query current DP values."""
+        msg = self._build_payload({"gwId": self.device_id, "devId": self.device_id})
+        reply = await self._send_receive(CMD_STATUS, msg)
+        return _extract_dps(reply)
+
+    async def set_dps(self, dps: dict[int, Any]) -> dict[int, Any]:
+        """Set one or more datapoints."""
+        payload = {
+            "devId": self.device_id,
+            "gwId": self.device_id,
+            "uid": self.device_id,
+            "t": str(int(time.time())),
+            "dps": {str(k): v for k, v in dps.items()},
+        }
+        reply = await self._send_receive(CMD_CONTROL, payload)
+        return _extract_dps(reply)
+
+    # -- wire-level helpers -------------------------------------------------------
+    def _build_payload(self, obj: dict[str, Any]) -> bytes:
+        return json.dumps(obj, separators=(",", ":")).encode("utf-8")
+
+    def _encrypt(self, data: bytes) -> bytes:
+        cipher = AES.new(self.local_key, AES.MODE_ECB)
+        return cipher.encrypt(pad(data, 16))
+
+    def _decrypt(self, data: bytes) -> bytes:
+        cipher = AES.new(self.local_key, AES.MODE_ECB)
+        return unpad(cipher.decrypt(data), 16)
+
+    def _frame(self, seq: int, command: int, payload: bytes) -> bytes:
+        length = len(payload) + FOOTER_SIZE
+        header = struct.pack(">IIII", PREFIX, seq, command, length)
+        body = header + payload
+        crc = _crc32(body)
+        return body + struct.pack(">II", crc, SUFFIX)
+
+    async def _send_receive(self, command: int, obj: dict[str, Any]) -> TuyaMessage:
+        if not self.connected:
+            await self.connect()
+        self._seq += 1
+        seq = self._seq
+        raw = self._build_payload(obj)
+        if self.protocol_version == "3.3":
+            enc = self._encrypt(raw)
+        else:  # 3.1 - DPS payloads are also AES-encrypted on the wire
+            enc = self._encrypt(raw)
+        packet = self._frame(seq, command, enc)
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[seq] = fut
+        async with self._lock:
+            self._writer.write(packet)
+            await self._writer.drain()
+        try:
+            return await asyncio.wait_for(fut, timeout=10)
+        finally:
+            self._pending.pop(seq, None)
+
+    async def _listen(self) -> None:
+        """Background reader - also delivers unsolicited status pushes."""
+        buf = b""
+        try:
+            while True:
+                chunk = await self._reader.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    msg, consumed = _try_parse(buf)
+                    if msg is None:
+                        break
+                    buf = buf[consumed:]
+                    try:
+                        payload = self._decrypt(msg.payload) if msg.payload else b""
+                        obj = json.loads(payload) if payload else None
+                    except Exception:  # noqa: BLE001 - malformed/heartbeat frame
+                        obj = None
+                    parsed = TuyaMessage(msg.seq, msg.command, obj)
+                    fut = self._pending.get(msg.seq)
+                    if fut and not fut.done():
+                        fut.set_result(parsed)
+                    elif obj and self._on_update:
+                        dps = _extract_dps(parsed)
+                        if dps:
+                            self._on_update(dps)
+        except (asyncio.CancelledError, ConnectionResetError, OSError):
+            pass
+
+
+@dataclass
+class _RawFrame:
+    seq: int
+    command: int
+    payload: bytes
+
+
+def _try_parse(buf: bytes) -> tuple[_RawFrame | None, int]:
+    if len(buf) < HEADER_SIZE:
+        return None, 0
+    prefix, seq, command, length = struct.unpack(">IIII", buf[:HEADER_SIZE])
+    if prefix != PREFIX:
+        raise TuyaProtocolError("bad packet prefix")
+    total = HEADER_SIZE + length
+    if len(buf) < total:
+        return None, 0
+    payload_len = length - FOOTER_SIZE
+    payload = buf[HEADER_SIZE : HEADER_SIZE + payload_len]
+    return _RawFrame(seq, command, payload), total
+
+
+def _extract_dps(msg: TuyaMessage) -> dict[int, Any]:
+    if not msg.payload:
+        return {}
+    dps = msg.payload.get("dps", {})
+    return {int(k): v for k, v in dps.items()}

@@ -1,0 +1,7 @@
+name: Generic single switch / plug
+product_ids: []
+dps:
+  - id: 1
+    platform: switch
+    name: Power
+    icon: mdi:power-plug

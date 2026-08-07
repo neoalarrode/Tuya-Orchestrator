@@ -1,0 +1,59 @@
+"""Per-device coordinator: owns the LAN connection, decodes DPs via the
+device's profile, and pushes updates to entities in real time.
+
+Reactive by design (matches this project family's philosophy, see
+Climate Orchestrator): the LAN socket itself delivers unsolicited DP-change
+frames (`on_update` callback in TuyaLocalDevice), so entities update
+instantly on a real device change. `DataUpdateCoordinator`'s periodic
+`_async_update_data` is kept only as a slow-interval fallback/reconnect
+check (`DEFAULT_SCAN_INTERVAL`), not the primary data path.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+from typing import Any
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from .const import DOMAIN
+from .profile import DeviceProfile
+from .tuya_lan import TuyaLocalDevice
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class TuyaOrchestratorCoordinator(DataUpdateCoordinator[dict[int, Any]]):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        device: TuyaLocalDevice,
+        profile: DeviceProfile,
+        scan_interval: int,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_{device.device_id}",
+            update_interval=timedelta(seconds=scan_interval),
+        )
+        self.device = device
+        self.profile = profile
+        device._on_update = self._handle_push  # noqa: SLF001 - internal wiring
+
+    def _handle_push(self, dps: dict[int, Any]) -> None:
+        merged = dict(self.data or {})
+        merged.update(dps)
+        self.async_set_updated_data(merged)
+
+    async def _async_update_data(self) -> dict[int, Any]:
+        try:
+            return await self.device.status()
+        except Exception as err:  # noqa: BLE001
+            raise UpdateFailed(f"Could not reach device on LAN: {err}") from err
+
+    async def async_set_dp(self, dp_id: int, raw_value: Any) -> None:
+        await self.device.set_dps({dp_id: raw_value})
+        # Optimistic local update; a real push/poll will confirm shortly after.
+        self._handle_push({dp_id: raw_value})

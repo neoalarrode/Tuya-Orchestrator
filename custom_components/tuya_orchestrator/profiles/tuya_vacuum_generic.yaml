@@ -1,0 +1,54 @@
+# Matches: "Habitación" / "Conga 11090 Spin Revolution Home&Wash" (category
+# "sd" - robot vacuum). Core control surface (start/pause/dock/battery/
+# status/suction) grouped into a real `vacuum.*` entity; clean-mode
+# strategy and volume stay as their own select/number, same shape HA's own
+# reference vacuum integrations use (one card + a couple of detail
+# controls, not everything crammed into one entity).
+#
+# NOTE: a different vacuum in the same account ("S1099", product_id
+# j6wUila5MykirOYY) uses a completely different DP layout for the same
+# features - see tuya_vacuum_conga_s1099.yaml, this profile won't match it
+# (product_ids below is specific on purpose).
+name: Tuya robot vacuum
+product_ids:
+  - kazdsquasfw0gmrn
+dps:
+  - id: 4
+    platform: select
+    name: Clean strategy
+    map:
+      smart: Smart
+      zone: Zone
+      pose: Pose
+  - id: 26
+    platform: number
+    name: Volume
+    unit: "%"
+    min: 0
+    max: 100
+    step: 10
+vacuums:
+  - name: Vacuum
+    start_dp: 1
+    pause_dp: 2
+    return_dp: 3
+    battery_dp: 8
+    status_dp: 5
+    status_map:
+      standby: idle
+      zone_clean: cleaning
+      part_clean: cleaning
+      cleaning: cleaning
+      paused: paused
+      goto_pos: cleaning
+      pos_arrived: idle
+      pos_unarrive: error
+      goto_charge: returning
+      charging: docked
+      charge_done: docked
+      sleep: idle
+    fan_speed_dp: 9
+    fan_speed_map:
+      gentle: Gentle
+      normal: Normal
+      strong: Strong

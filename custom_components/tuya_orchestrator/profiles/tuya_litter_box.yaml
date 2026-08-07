@@ -1,0 +1,26 @@
+# Matches: "Pumba 8000/8500 cleankitty smart" (category "msp" - smart
+# litter box). Read-only monitoring + deodorizer switch; no cleaning-cycle
+# control DP was exposed by the cloud schema for this product.
+name: Tuya smart litter box (monitoring)
+product_ids:
+  - kisutga2hd061a39
+dps:
+  - id: 6
+    platform: sensor
+    name: Cat weight
+    unit: g
+    icon: mdi:scale
+  - id: 7
+    platform: sensor
+    name: Excretions today
+    unit: times
+    icon: mdi:counter
+  - id: 8
+    platform: sensor
+    name: Excretion duration
+    unit: s
+    icon: mdi:timer-outline
+  - id: 17
+    platform: switch
+    name: Deodorizer
+    icon: mdi:spray

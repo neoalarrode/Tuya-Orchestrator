@@ -1,0 +1,44 @@
+# Matches: "Despacho" / "Pasillo abajo" (category "qn", product_id
+# n72zzd550zyw8qte, model "ReadyWarm Crystal Connected"). This schema was
+# NOT available via the standard v1.x specification/functions/status cloud
+# endpoints (all three returned errors) - recovered via the newer v2.0
+# "Thing Data Model" endpoint (/v2.0/cloud/thing/{id}/model).
+#
+# "Mode" (High/Low) is a power-intensity setting, not a real off/heat/cool
+# HVAC mode - modeled as a `preset_mode` on the climate entity rather than
+# forced into hvac_mode. Child lock and the countdown timer aren't part of
+# a standard thermostat card, so they stay as their own switch/number
+# entities alongside the climate entity.
+name: Tuya heater - ReadyWarm Crystal Connected
+product_ids:
+  - n72zzd550zyw8qte
+dps:
+  - id: 2
+    platform: switch
+    name: Child lock
+    icon: mdi:lock
+  - id: 5
+    platform: number
+    name: Timer
+    unit: min
+    min: 0
+    max: 1440
+    step: 60
+  - id: 6
+    platform: sensor
+    name: Fault code
+    # Raw bitmap, not decoded (0 = no fault; device's own labels
+    # Fault_1/Fault_2 aren't descriptive).
+climates:
+  - name: Heater
+    icon: mdi:radiator
+    switch_dp: 1
+    target_temp_dp: 3
+    target_temp_min: 5
+    target_temp_max: 40
+    target_temp_step: 1
+    current_temp_dp: 4
+    preset_dp: 7
+    preset_map:
+      High: High
+      Low: Low

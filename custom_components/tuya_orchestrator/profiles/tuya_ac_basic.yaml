@@ -1,0 +1,52 @@
+# Matches: "AirClima dormitorio" / "AirClima 12000 Multi Indoor Connected 2"
+# (category "kt" - portable/split AC unit).
+#
+# Grouped into a real `climate.*` entity (thermostat card: mode/setpoint/
+# current temp/fan speed/humidity all in one) instead of separate switch +
+# number + select + sensor entities for the same handful of DPs.
+#
+# RESOLVED CAVEAT: the raw cloud schema declares temp_set's max as 880
+# (-> 88.0 C after the scale divisor), implausible for a real AC setpoint.
+# Re-checked via the v2.0 Thing Data Model endpoint: that SAME response's
+# own human-readable `description` field says "摄氏：16~31" (Celsius:
+# 16-31) - a live reading (raw temp_set=215 -> 21.5C after scale) sits well
+# inside that range, nowhere near 88C. Conclusion: `max:880` is a genuine
+# metadata error in Tuya's own cloud schema (very likely copy-pasted from
+# the parallel Fahrenheit DP's max=88), not a real device limit - using 31
+# here instead, and saying so.
+#
+# Only the most commonly-used DPs are mapped. The full schema also exposes:
+# sleep mode, louver swing (up/down, left/right), air quality, dirty
+# filter, energy counters - available if wanted, ask and they can be added.
+name: Tuya portable/split AC
+product_ids:
+  - 4epook7bjtjzcxjb
+dps: []
+climates:
+  - name: AC
+    icon: mdi:air-conditioner
+    switch_dp: 1
+    current_temp_dp: 3
+    target_temp_dp: 2
+    target_temp_scale: 10  # Tuya scale=1 -> divisor 10
+    target_temp_min: 16
+    target_temp_max: 31   # corrected from the schema's erroneous max:880 - see note above
+    target_temp_step: 0.5
+    mode_dp: 4
+    mode_map:
+      cold: cool
+      hot: heat
+      wet: dry
+      wind: fan_only
+      auto: heat_cool
+    fan_dp: 5
+    fan_map:
+      strong: Strong
+      high: High
+      mid_high: Medium-high
+      mid: Medium
+      mid_low: Medium-low
+      low: Low
+      mute: Mute
+      auto: Auto
+    humidity_dp: 18

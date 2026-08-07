@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Agregar un dispositivo Tuya",
+        "menu_options": {
+          "cloud": "Obtener local_key vía Tuya Cloud (recomendado)",
+          "manual": "Ingresar IP / device_id / local_key manualmente"
+        }
+      },
+      "cloud": {
+        "title": "Credenciales del proyecto Tuya Cloud",
+        "description": "De tu proyecto en Tuya IoT Platform (Cloud > Devices > Link Tuya App Account para el UID). Se usa una sola vez, solo para obtener los local_keys.",
+        "data": {
+          "region": "Región",
+          "access_id": "Access ID / Client ID",
+          "access_secret": "Access Secret / Client Secret",
+          "uid": "UID de la cuenta de app vinculada"
+        }
+      },
+      "pick_cloud_device": {
+        "title": "Elegí un dispositivo",
+        "data": { "device_id": "Dispositivo" }
+      },
+      "manual": {
+        "title": "Alta manual",
+        "data": {
+          "device_id": "Device ID",
+          "local_key": "Local key",
+          "address": "Dirección IP",
+          "protocol_version": "Versión de protocolo"
+        }
+      },
+      "profile": {
+        "title": "Perfil del dispositivo",
+        "description": "Elegí un perfil incluido o pegá tu propio YAML describiendo los datapoints del dispositivo.",
+        "data": {
+          "profile_choice": "Perfil",
+          "profile_yaml": "YAML de perfil personalizado"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Credenciales de Tuya Cloud inválidas.",
+      "cannot_connect": "No se pudo contactar a la API de Tuya Cloud.",
+      "no_devices_found": "No se encontraron dispositivos para esa cuenta vinculada (UID).",
+      "not_found_on_lan": "El dispositivo aún no aparece en la red LAN - asegurate de que esté encendido y en la misma red/VLAN, y reintentá.",
+      "invalid_profile": "YAML de perfil inválido."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Editar perfil / intervalo de sondeo",
+        "data": {
+          "profile_yaml": "YAML de perfil",
+          "scan_interval": "Intervalo de sondeo de respaldo (segundos)"
+        }
+      }
+    }
+  }
+}

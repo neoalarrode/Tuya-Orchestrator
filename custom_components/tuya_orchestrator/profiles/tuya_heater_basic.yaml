@@ -1,0 +1,16 @@
+# Matches: "Dormitorio" heater (category "qn", product_id ynjanlglr4qa6dxf).
+# No distinct "mode" DP on this model - just on/off + setpoint - so the
+# resulting climate entity exposes exactly [off, heat], driven by switch_dp.
+name: Tuya electric heater
+product_ids:
+  - ynjanlglr4qa6dxf
+dps: []
+climates:
+  - name: Heater
+    icon: mdi:radiator
+    switch_dp: 1
+    target_temp_dp: 3
+    target_temp_min: 5
+    target_temp_max: 40
+    target_temp_step: 1
+    current_temp_dp: 4

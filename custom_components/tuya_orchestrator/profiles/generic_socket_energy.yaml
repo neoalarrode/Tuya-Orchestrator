@@ -1,0 +1,30 @@
+name: Generic smart plug (with energy monitoring)
+product_ids: []
+dps:
+  - id: 1
+    platform: switch
+    name: Power
+    icon: mdi:power-plug
+  - id: 9
+    platform: select
+    name: Countdown
+    map:
+      0: "off"
+  - id: 18
+    platform: sensor
+    name: Current
+    device_class: current
+    unit: mA
+    scale: 1
+  - id: 19
+    platform: sensor
+    name: Power
+    device_class: power
+    unit: W
+    scale: 10
+  - id: 20
+    platform: sensor
+    name: Voltage
+    device_class: voltage
+    unit: V
+    scale: 10
