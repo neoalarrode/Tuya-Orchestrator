@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.2.2 - fix: encrypted broadcast (port 6667) decryption was completely broken
+
+Found by diffing against localtuya's actual `discovery.py` (`master`
+branch), at the user's request, after the "not seen on LAN" report
+persisted post-v0.1.1 (which only fixed the port-bind conflict, not this):
+
+- **Wrong AES key, two stacked bugs on the same constant.** The real key
+  for decrypting port 6667's encrypted broadcast is `MD5(b"yGAdlopoPVldABfn")`
+  - a derived 16-byte digest. This module used the 16-character seed
+  string's raw bytes directly AS the key (missing the MD5 step
+  entirely), AND that seed string had a one-character typo ("PVLd"
+  instead of the correct "PVld"). Net effect: every encrypted-broadcast
+  packet failed to decrypt, silently (caught by the existing broad
+  except-and-skip in `datagram_received`) - a device broadcasting only on
+  6667 (common) was never discovered, full stop, independent of the port-
+  bind fix. Verified with a round-trip encrypt/decrypt test against the
+  corrected key.
+- Also simplified port binding to match localtuya's proven approach:
+  `asyncio.create_datagram_endpoint(local_addr=..., reuse_port=True)`
+  directly, replacing the v0.1.1 manual-socket-with-SO_REUSEADDR approach.
+  `reuse_port=True` already sets SO_REUSEPORT before bind - same result,
+  less custom code, and now matches how the thing most likely to already
+  hold this port (localtuya itself) actually behaves.
+
+## v0.2.1 - fix: don't offer devices not actually seen on the LAN
+
+- `account.py`'s poller was offering every device the CLOUD knows about as
+  a "Discovered" card, even ones never seen on this local network (`found
+  is None` was still passed through with `ip: None`, relying on the
+  `discovery_ip` fallback step to catch it later). Fixed to `continue`
+  (skip entirely) when the LAN broadcast pass didn't see the device -
+  discovery now means "present on this network right now", matching what
+  HomeKit/Tapo-style discovery actually implies, not "exists somewhere on
+  your Tuya account". A cloud-known device that isn't on this LAN can
+  still be added via the "manual" (no-cloud) flow with a hand-entered IP.
+- The `discovery_ip` step in config_flow.py stays as a narrow safety net
+  (device goes offline between the poll and the user clicking Configure a
+  moment later), no longer the routine path.
+
 ## v0.2.0 - account-based discovery (Configure/Ignore UX, like HomeKit/Tapo)
 
 **Config flow rearchitected**, user-requested after the port-conflict

@@ -3,12 +3,20 @@
 An account entry holds only Tuya Cloud credentials - no device of its own.
 Once set up, it periodically polls Tuya Cloud for this account's full
 device list plus a LAN broadcast pass, and for every device NOT already
-configured (or ignored) triggers a native HA discovery flow
-(`SOURCE_INTEGRATION_DISCOVERY`) - which HA's frontend renders as a
-"Discovered" card with Configure/Ignore buttons, the same UX pattern as
-HomeKit Controller or Tapo. One ConfigEntry per device is still created
-(same as before), just no longer via a manual multi-step wizard - the
-account entry is the thing that finds them.
+configured (or ignored) AND actually seen on the local network just now
+triggers a native HA discovery flow (`SOURCE_INTEGRATION_DISCOVERY`) -
+which HA's frontend renders as a "Discovered" card with Configure/Ignore
+buttons, the same UX pattern as HomeKit Controller or Tapo. One
+ConfigEntry per device is still created (same as before), just no longer
+via a manual multi-step wizard - the account entry is the thing that finds
+them.
+
+A device the cloud knows about but that hasn't broadcast on this LAN
+(offline, different VLAN/subnet, firewalled) is deliberately NOT offered -
+discovery here means "present on this network right now", matching what
+HomeKit/Tapo-style discovery actually means; a device merely existing on
+the Tuya account isn't the same claim. Such a device can still be added
+via the "manual" (no-cloud) flow with a hand-entered IP.
 
 Dedup relies on `ConfigFlow.async_set_unique_id()`'s own built-in
 behavior: calling it a second time for a still-in-progress flow with the
@@ -65,13 +73,15 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
             if device_id in configured_ids:
                 continue
             found = lan.get(device_id)
+            if found is None:
+                continue  # not seen on this LAN right now - don't offer it
             await hass.config_entries.flow.async_init(
                 DOMAIN,
                 context={"source": SOURCE_INTEGRATION_DISCOVERY},
                 data={
                     **device,
-                    "ip": found.ip if found else None,
-                    "version": found.version if found else None,
+                    "ip": found.ip,
+                    "version": found.version,
                     CONF_ACCOUNT_ENTRY_ID: entry.entry_id,
                 },
             )

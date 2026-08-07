@@ -47,12 +47,23 @@ TUYA_REGIONS = {
 }
 
 # ---------------------------------------------------------------------------
-# LAN UDP discovery (well-documented Tuya broadcast ports/keys, used by the
+# LAN UDP discovery (well-documented Tuya broadcast ports/key, used by the
 # reference open-source implementations tinytuya/localtuya).
+#
+# BUG FIXED HERE (found by diffing against localtuya's actual source,
+# custom_components/localtuya/discovery.py on the `master` branch): the AES
+# key for the encrypted broadcast (port 6667) is `MD5(b"yGAdlopoPVldABfn")`
+# - a 16-byte DIGEST, not the 16-character seed string used directly as the
+# key. This module previously used the raw seed string AS the key, AND had
+# a one-character typo in it ("PVLd" vs the correct "PVld") - two
+# independent bugs stacked on the same constant. Net effect: decrypting
+# port 6667 broadcasts never worked, so any device that broadcasts only
+# on the encrypted port (common) was never actually discovered, even after
+# the port-bind fix in v0.1.1. See discovery.py for the MD5 step.
 # ---------------------------------------------------------------------------
 UDP_PORT_UNENCRYPTED = 6666
 UDP_PORT_ENCRYPTED = 6667
-UDP_KEY_ENCRYPTED = b"yGAdlopoPVLdABfn"  # fixed, published broadcast key
+UDP_KEY_SEED = b"yGAdlopoPVldABfn"  # MD5 of this is the real AES key - see discovery.py
 DISCOVERY_TIMEOUT = 8
 DISCOVERY_POLL_INTERVAL = 300  # seconds; how often an "account" entry re-scans for new devices
 
