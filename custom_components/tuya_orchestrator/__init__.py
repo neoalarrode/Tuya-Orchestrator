@@ -12,11 +12,13 @@ Two kinds of ConfigEntry:
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
 from .account import async_setup_account
@@ -32,9 +34,10 @@ from .const import (
     DOMAIN,
     ENTRY_TYPE_ACCOUNT,
     PLATFORMS,
+    RECONNECT_INTERVAL,
 )
 from .coordinator import TuyaOrchestratorCoordinator
-from .discovery import PersistentDiscovery
+from .discovery import DiscoveredDevice, PersistentDiscovery
 from .profile import parse_profile
 from .tuya_lan import TuyaLocalDevice
 
@@ -51,12 +54,67 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     enough - found by reviewing localtuya's full codebase after a live
     report that devices confirmed present on the LAN still weren't being
     discovered even after v0.2.9's port/framing fixes."""
-    listener = PersistentDiscovery()
+
+    def _on_device_seen(device: DiscoveredDevice) -> None:
+        # BUG FIXED HERE (v0.7.0): a configured device's IP is a plain DHCP
+        # lease, not something guaranteed to stay put forever - when it
+        # changed, this integration kept dialing the OLD address forever,
+        # forcing the user to remove and re-pair the device by hand to
+        # "notice" the new one. localtuya reacts to every broadcast it
+        # hears (`_device_discovered` in its `__init__.py`) and, on an IP
+        # mismatch against the stored entry, calls
+        # `hass.config_entries.async_update_entry(...)` with the new
+        # address - that alone is enough, because HA calls every
+        # registered `add_update_listener` (already wired below, in
+        # `_async_setup_device_entry`) on ANY entry data change, which
+        # reloads the entry and reconnects with the fresh IP. Same
+        # mechanism ported here, 1:1.
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            if entry.data.get(CONF_DEVICE_ID) != device.device_id:
+                continue
+            if entry.data.get("address") == device.ip:
+                break
+            _LOGGER.info(
+                "Tuya Orchestrator: device %s changed IP %s -> %s, updating and reloading",
+                device.device_id,
+                entry.data.get("address"),
+                device.ip,
+            )
+            new_data = dict(entry.data)
+            new_data["address"] = device.ip
+            hass.config_entries.async_update_entry(entry, data=new_data)
+            break
+
+    listener = PersistentDiscovery(on_device=_on_device_seen)
     await listener.start()
     hass.data.setdefault(DOMAIN, {})[DISCOVERY_DATA_KEY] = listener
 
+    async def _async_reconnect(now) -> None:
+        # Companion fix to the above: an IP-unchanged disconnect (device
+        # rebooted, briefly lost power/wifi, TCP reset...) doesn't trigger
+        # a reload on its own - matches localtuya's own periodic
+        # `_async_reconnect` (`RECONNECT_INTERVAL`), which retries any
+        # device it still has marked as disconnected instead of waiting
+        # for the user to intervene.
+        for stored in list(hass.data.get(DOMAIN, {}).values()):
+            if not isinstance(stored, dict) or "device" not in stored:
+                continue
+            device: TuyaLocalDevice = stored["device"]
+            if device.connected:
+                continue
+            _LOGGER.debug("Tuya Orchestrator: retrying connection to %s", device.device_id)
+            try:
+                await device.connect()
+            except Exception as err:  # noqa: BLE001 - just retry again next interval
+                _LOGGER.debug("Tuya Orchestrator: reconnect to %s failed: %s", device.device_id, err)
+
+    hass.data[DOMAIN]["_reconnect_unsub"] = async_track_time_interval(
+        hass, _async_reconnect, timedelta(seconds=RECONNECT_INTERVAL)
+    )
+
     def _on_stop(event) -> None:
         listener.close()
+        hass.data[DOMAIN]["_reconnect_unsub"]()
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop)
     return True

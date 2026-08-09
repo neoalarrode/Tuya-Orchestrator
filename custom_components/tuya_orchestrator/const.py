@@ -40,6 +40,10 @@ DEFAULT_PROTOCOL_VERSION = "3.3"
 SUPPORTED_PROTOCOL_VERSIONS = ["3.1", "3.3", "3.4"]
 DEFAULT_SCAN_INTERVAL = 30  # seconds; fallback poll, LAN push is the primary path
 DEFAULT_PORT = 6668
+RECONNECT_INTERVAL = 60  # seconds; matches localtuya's own `RECONNECT_INTERVAL` -
+# periodic retry for any configured device currently disconnected (dropped
+# TCP connection, device rebooted, etc.) so it comes back on its own instead
+# of needing the entry removed/re-added by hand.
 
 # ---------------------------------------------------------------------------
 # Tuya Cloud API regions (official OpenAPI endpoints, documented at

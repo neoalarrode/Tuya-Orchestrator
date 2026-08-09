@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.7.0 - automatic IP re-resolution and reconnect, no more remove/re-add
+
+Reported live: after a device's DHCP lease renewed with a new IP, the
+integration kept dialing the old address forever - the only way to
+recover was to delete and re-pair the device by hand. That's not how
+`localtuya` behaves and it isn't how this integration is meant to behave
+either, given `PersistentDiscovery` (running continuously since
+`async_setup()`) already hears every broadcast a device sends, IP
+included.
+
+Ported localtuya's exact mechanism (`__init__.py`'s `_device_discovered` +
+`_async_reconnect`), 1:1:
+
+1. **Live IP re-resolution**: `PersistentDiscovery` now calls a callback
+   on every broadcast it decodes, not just on new/first-seen devices (see
+   `discovery.py`'s `_DiscoveryProtocol.datagram_received`). `__init__.py`
+   registers `_on_device_seen`, which checks every configured device
+   entry for an IP mismatch against what was just heard and, if it
+   differs, updates the `ConfigEntry`'s `address` via
+   `hass.config_entries.async_update_entry(...)`. HA's own
+   `add_update_listener` (already wired per entry) reacts to that data
+   change by reloading the entry, which reconnects with the fresh IP -
+   no user action needed, exactly like a DHCP-based device is supposed to
+   behave.
+2. **Periodic reconnect for IP-unchanged drops**: a device that just lost
+   its TCP connection (reboot, brief wifi loss, TCP reset) without
+   actually changing IP doesn't trigger the path above. Added a
+   `RECONNECT_INTERVAL` (60s, same value localtuya uses) timer in
+   `async_setup()` that retries `device.connect()` for any configured
+   device currently showing `connected == False`.
+
+Together these remove the last real case where "remove and re-add the
+device" was the only fix - that should no longer ever be necessary for a
+device that's genuinely reachable on the LAN.
+
 ## v0.6.0 - full-project audit: 6 more real bugs, including the actual reason the LAN error persisted
 
 Requested explicitly ("revisa todo el puñetero proyecto, conjunto") - a

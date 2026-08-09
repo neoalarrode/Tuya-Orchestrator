@@ -46,6 +46,7 @@ import asyncio
 import json
 import logging
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import md5
 
@@ -129,8 +130,13 @@ def _decode_broadcast(data: bytes) -> dict | None:
 
 
 class _DiscoveryProtocol(asyncio.DatagramProtocol):
-    def __init__(self, results: dict[str, DiscoveredDevice]) -> None:
+    def __init__(
+        self,
+        results: dict[str, DiscoveredDevice],
+        on_device: "Callable[[DiscoveredDevice], None] | None" = None,
+    ) -> None:
         self.results = results
+        self._on_device = on_device
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: D102
         obj = _decode_broadcast(data)
@@ -139,21 +145,36 @@ class _DiscoveryProtocol(asyncio.DatagramProtocol):
         gw_id = obj.get("gwId")
         if not gw_id:
             return
-        self.results[gw_id] = DiscoveredDevice(
+        device = DiscoveredDevice(
             device_id=gw_id,
             ip=obj.get("ip", addr[0]),
             product_key=obj.get("productKey"),
             version=obj.get("version"),
         )
+        self.results[gw_id] = device
+        # BUG FIXED HERE (v0.7.0): the cache was updated but nothing was ever
+        # told about it - a configured device's IP changing (a normal DHCP
+        # lease renewal, not an error) silently went stale in the cache while
+        # the actual running connection kept using the OLD address forever,
+        # forcing the device to be removed and re-added by hand to pick up
+        # the new IP. localtuya's own `__init__.py` calls its discovery
+        # callback (`_device_discovered`) on EVERY broadcast heard, precisely
+        # so it can react live to an IP change - see __init__.py's
+        # `_on_device_seen` for the update_entry side of this fix.
+        if self._on_device is not None:
+            self._on_device(device)
 
 
-async def _bind_all_ports(results: dict[str, DiscoveredDevice]) -> list:
+async def _bind_all_ports(
+    results: dict[str, DiscoveredDevice],
+    on_device: "Callable[[DiscoveredDevice], None] | None" = None,
+) -> list:
     loop = asyncio.get_event_loop()
     transports = []
     for port in (UDP_PORT_UNENCRYPTED, UDP_PORT_ENCRYPTED, UDP_PORT_APP):
         try:
             transport, _ = await loop.create_datagram_endpoint(
-                lambda: _DiscoveryProtocol(results),
+                lambda: _DiscoveryProtocol(results, on_device),
                 local_addr=("0.0.0.0", port),
                 reuse_port=True,
             )
@@ -197,12 +218,13 @@ class PersistentDiscovery:
     calling `discover_devices()` fresh each cycle.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_device: "Callable[[DiscoveredDevice], None] | None" = None) -> None:
         self.devices: dict[str, DiscoveredDevice] = {}
         self._transports: list = []
+        self._on_device = on_device
 
     async def start(self) -> None:
-        self._transports = await _bind_all_ports(self.devices)
+        self._transports = await _bind_all_ports(self.devices, self._on_device)
 
     def close(self) -> None:
         for t in self._transports:
