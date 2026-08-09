@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.12.2 - stop dropping spontaneous reports; make an unreadable device say so
+
+Two findings from reviewing live diagnostics for two misbehaving devices.
+
+### Every spontaneous report was being dropped
+
+Both devices' traces showed the same line:
+
+```
+rx seq=0  0x08  95B  -> DROPPED (no waiter, undecodable)
+```
+
+95 is exactly 15 + 80: a version header plus five AES blocks. The header
+was not being stripped, so what remained was not a block multiple,
+decryption failed, and the frame was discarded.
+
+The cause is a porting mistake. The reference tests only the **3-byte
+version prefix** (`payload.startswith(self.version_bytes)`) before
+stripping the full 15-byte header; this required the entire 15 bytes to
+match - version bytes plus twelve zero bytes. A device that sends "3.3"
+followed by twelve bytes that are not all zero kept its header and had
+every such frame thrown away.
+
+Spontaneous reports are how this integration is meant to learn about
+changes at all (see coordinator.py's "reactive, not polling" design), so
+affected devices were silently reduced to the 30-second fallback poll.
+
+### A device that cannot be decrypted now says so
+
+One entry was connected, heartbeating happily, and had **zero
+datapoints** - because an old active-scan false positive had given it
+another device's IP, so it was talking to the wrong host with the right
+key. Every reply came back undecryptable, `status()` returned `{}` as
+designed, and nothing anywhere said a word.
+
+After three consecutive polls with no usable data, the log now names the
+device and address and says plainly that the device is replying and
+cannot be read - typically a key that does not belong to whatever is
+actually at that address.
+
 ## v0.12.1 - stop spontaneous reports impersonating command replies
 
 From a live report of a device dropping its connection twice, and the

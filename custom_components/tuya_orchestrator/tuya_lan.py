@@ -843,7 +843,23 @@ class TuyaLocalDevice:
                 text = self._decrypt_raw(base64.b64decode(raw[19:])).decode("utf-8")
             else:  # 3.3 (or 3.1 non-CONTROL replies, same shape as 3.3)
                 payload = raw
-                if payload[: len(self.version_header)] == self.version_header:
+                # BUG FIXED HERE: this required the WHOLE 15-byte version
+                # header to match - the version bytes plus twelve zero
+                # bytes. The reference only tests the 3-byte version prefix
+                # (`payload.startswith(self.version_bytes)`) and then strips
+                # the full 15. A device that sends "3.3" followed by twelve
+                # bytes that are not all zero therefore had its header left
+                # in place here, leaving a payload that is not an AES block
+                # multiple, so decryption failed and the frame was dropped.
+                # Not theoretical: on a live instance both an air
+                # conditioner and a bathroom device were dropping every
+                # spontaneous 0x08 report this way - "rx 0x08 95B ->
+                # DROPPED (undecodable)", and 95 is exactly 15 + 80. Since
+                # spontaneous reports are how this integration is supposed
+                # to learn about changes at all (see coordinator.py), those
+                # devices were silently reduced to the 30-second fallback
+                # poll.
+                if payload.startswith(self.version_bytes):
                     payload = payload[len(self.version_header) :]
                 elif self.dev_type == DEV_TYPE_0D and (len(payload) & 0x0F) != 0:
                     # type_0d heuristic, ported verbatim from the reference:

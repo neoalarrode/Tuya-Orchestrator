@@ -23,6 +23,11 @@ from .tuya_lan import TuyaLocalDevice
 
 _LOGGER = logging.getLogger(__name__)
 
+# Consecutive empty polls before warning that a device is unreadable. A few
+# empty replies are normal (a device with nothing to report yet); a steady
+# run of them is not.
+_UNDECODABLE_POLLS_BEFORE_WARNING = 3
+
 
 class TuyaOrchestratorCoordinator(DataUpdateCoordinator[dict[int, Any]]):
     def __init__(
@@ -40,6 +45,7 @@ class TuyaOrchestratorCoordinator(DataUpdateCoordinator[dict[int, Any]]):
         )
         self.device = device
         self.profile = profile
+        self._undecodable_polls = 0
         device._on_update = self._handle_push  # noqa: SLF001 - internal wiring
         # Mirrors localtuya's `disconnected()` -> dispatch None -> entities
         # go unavailable. Without this, a connection that dropped between
@@ -73,6 +79,30 @@ class TuyaOrchestratorCoordinator(DataUpdateCoordinator[dict[int, Any]]):
         except Exception as err:  # noqa: BLE001
             raise UpdateFailed(f"Could not reach device on LAN: {err}") from err
         _LOGGER.debug("%s: DP_QUERY returned %s", self.device.device_id, fresh)
+        # GAP FIXED HERE: a device answering every query with something we
+        # cannot decrypt looked exactly like a healthy device with nothing
+        # to say - connected, heartbeats fine, entities simply empty
+        # forever, and not one line in the log. That is the signature of a
+        # WRONG local_key or, more often, a right key pointed at the wrong
+        # host: found on a live instance, where one entry had been given
+        # another device's IP by an old active-scan false positive and had
+        # sat there with zero datapoints ever since. Say so, once, instead
+        # of failing silently.
+        if not fresh and not self.data:
+            self._undecodable_polls += 1
+            if self._undecodable_polls == _UNDECODABLE_POLLS_BEFORE_WARNING:
+                _LOGGER.warning(
+                    "%s at %s: connected, but %d consecutive queries returned no usable data. "
+                    "The device is replying and we cannot read it - typically a local_key that "
+                    "does not belong to whatever is actually at this address. Check that %s is "
+                    "really this device.",
+                    self.device.device_id,
+                    self.device.address,
+                    self._undecodable_polls,
+                    self.device.address,
+                )
+        elif fresh:
+            self._undecodable_polls = 0
         merged = dict(self.data or {})
         merged.update(fresh)
         return merged
