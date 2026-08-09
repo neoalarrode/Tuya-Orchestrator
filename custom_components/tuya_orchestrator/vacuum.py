@@ -55,8 +55,13 @@ class TuyaVacuum(CoordinatorEntity[TuyaOrchestratorCoordinator], StateVacuumEnti
             features |= VacuumEntityFeature.RETURN_HOME
         if mapping.locate_dp is not None:
             features |= VacuumEntityFeature.LOCATE
-        if mapping.battery_dp is not None:
-            features |= VacuumEntityFeature.BATTERY
+        # BUG FIXED HERE (live report against HA 2026.8): VacuumEntityFeature
+        # .BATTERY and the battery_level property are deprecated - HA logs a
+        # warning for any integration still setting them. The modern
+        # replacement is a plain companion sensor.* entity (device_class
+        # "battery") on the same device, which HA's vacuum more-info dialog
+        # picks up automatically via the shared device - see sensor.py's
+        # TuyaVacuumBatterySensor, built from this same battery_dp.
         if mapping.status_dp is not None:
             features |= VacuumEntityFeature.STATE
         if mapping.fan_speed_dp is not None and mapping.fan_speed_map:
@@ -76,15 +81,6 @@ class TuyaVacuum(CoordinatorEntity[TuyaOrchestratorCoordinator], StateVacuumEnti
             if label in _ACTIVITY_VALUES:
                 return VacuumActivity(label)
         return None
-
-    @property
-    def battery_level(self) -> int | None:
-        if self._mapping.battery_dp is None:
-            return None
-        raw = self._data.get(self._mapping.battery_dp)
-        if raw is None:
-            return None
-        return round(raw / self._mapping.battery_scale) if self._mapping.battery_scale else round(raw)
 
     @property
     def fan_speed(self) -> str | None:

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.5.1 - fix: false-positive device matching in active scan, deprecated battery_level
+
+**Critical fix**: `active_scan.py`'s device identification only checked
+"did `status()` raise an exception?" - but a WRONG local_key/host/version
+combination does NOT reliably raise. `tuya_lan.py`'s `status()`
+deliberately swallows any undecryptable reply into an empty `{}` (by
+design, so one garbled push doesn't crash a running device), so the old
+check was true for ANY host that merely replied to a query at all -
+meaning literally any Tuya device open on port 6668 on the LAN could get
+"identified" as a match for whichever candidate device_id happened to be
+tried against it next, real key or not. Live report matched this exactly:
+phantom devices kept getting offered, and a real device's own IP got
+silently stolen by a wrong match, leaving it unable to connect ("dice que
+no está en LAN" for a device that plainly was). Fixed to require actual
+non-empty DPS data back - a real, meaningful identification.
+
+Also fixed a deprecation warning against HA 2026.8: `vacuum.py` exposed
+battery via the deprecated `StateVacuumEntity.battery_level` property +
+`VacuumEntityFeature.BATTERY`. Replaced with the modern pattern: a plain
+companion `sensor.*` entity (`device_class: battery`) on the same device
+(`sensor.py`'s new `TuyaVacuumBatterySensor`), which HA's vacuum
+more-info dialog picks up automatically via the shared device link - no
+feature flag needed at all.
+
 ## v0.5.0 - protocol 3.4 support, ported directly from localtuya
 
 At the user's explicit request ("tienes que basar el código en

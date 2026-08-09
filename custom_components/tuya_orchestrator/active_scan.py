@@ -103,7 +103,22 @@ _PROBE_VERSIONS = ("3.3", "3.4")
 
 async def _try_identify(ip: str, device_id: str, local_key: str) -> str | None:
     """Returns the protocol version that successfully identified the
-    device, or None if no version worked against this host."""
+    device, or None if no version worked against this host.
+
+    CRITICAL BUG FIXED HERE: a wrong local_key/host/version combination
+    does NOT reliably raise an exception. tuya_lan.py's status() swallows
+    any undecryptable reply into an empty {} return (by design, for
+    normal operation - a single garbled push shouldn't crash a running
+    device), so the old check here ("did status() raise?") was true for
+    ANY host that merely replied to a query at all - meaning literally any
+    Tuya device open on port 6668 on the LAN could get "identified" as a
+    match for whichever candidate device_id happened to be tried against
+    it next, regardless of whether the key was actually right. Confirmed
+    from a live report: phantom devices kept getting offered, and the
+    real device's own IP got silently stolen by a wrong match, leaving it
+    unable to connect. Fixed to require ACTUAL non-empty DPS data back -
+    a real, meaningful identification, not just "no exception happened".
+    """
     for version in _PROBE_VERSIONS:
         device = TuyaLocalDevice(device_id, ip, local_key, protocol_version=version)
         try:
@@ -113,8 +128,9 @@ async def _try_identify(ip: str, device_id: str, local_key: str) -> str | None:
             # is for the real connect once a device is actually being
             # paired, not for scanning).
             await device.connect(timeout=IDENTIFY_TIMEOUT, retries=1)
-            await asyncio.wait_for(device.status(), timeout=IDENTIFY_TIMEOUT)
-            return version
+            dps = await asyncio.wait_for(device.status(), timeout=IDENTIFY_TIMEOUT)
+            if dps:  # non-empty dict required - see the bug note above
+                return version
         except Exception:  # noqa: BLE001 - wrong host/key/version/offline - just not a match yet
             continue
         finally:
