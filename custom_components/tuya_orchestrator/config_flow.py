@@ -151,10 +151,11 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 found = (await discover_devices()).get(device_id)
             self._chosen_ip = found.ip if found else None
             version = found.version if found else version
-        if version and version not in ("3.1", "3.3"):
-            # Protocol 3.4/3.5 isn't implemented yet (see tuya_lan.py) -
-            # abort here with a clear reason instead of creating an entry
-            # that's guaranteed to fail at setup.
+        # 3.4 is now a real, ported implementation (session-key handshake -
+        # see tuya_lan.py) - this guard used to reject it outright; only
+        # 3.5 (a different device family, still genuinely unimplemented)
+        # aborts here now.
+        if version and version not in SUPPORTED_PROTOCOL_VERSIONS:
             return self.async_abort(reason="unsupported_protocol_version")
         if version in SUPPORTED_PROTOCOL_VERSIONS:
             self._manual_protocol = version

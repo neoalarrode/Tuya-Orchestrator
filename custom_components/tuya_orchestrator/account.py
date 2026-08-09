@@ -163,8 +163,10 @@ async def async_setup_account(hass: HomeAssistant, entry: ConfigEntry) -> None:
         if not matches:
             return
         by_id = {d["device_id"]: d for d in missing}
-        for device_id, ip in matches.items():
-            await _offer(by_id[device_id], ip, "3.3")  # identified via a 3.3-protocol probe, see active_scan.py
+        for device_id, (ip, version) in matches.items():
+            # version is whichever protocol actually identified this
+            # device (active_scan.py tries 3.3 then 3.4) - never assumed.
+            await _offer(by_id[device_id], ip, version)
         _LOGGER.info(
             "Tuya account %s: active scan found %d device(s) passive discovery missed: %s",
             entry.title,

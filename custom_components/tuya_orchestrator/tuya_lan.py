@@ -1,52 +1,58 @@
-"""Minimal local (LAN) Tuya protocol client.
+"""Local (LAN) Tuya protocol client - based directly on localtuya's
+`custom_components/localtuya/pytuya/__init__.py` (at the user's explicit
+request, after a series of independent bugs kept surfacing from a
+from-scratch reimplementation). Wire constants, framing, and the protocol
+3.4 session-key handshake below are a deliberate, careful PORT of that
+reference, not a re-derivation - adapted to this project's simpler single
+`TuyaLocalDevice` class (the reference splits this across
+`TuyaProtocol`/`MessageDispatcher`/`AESCipher`) so the rest of this
+codebase (coordinator.py, active_scan.py) didn't need to change.
 
-Implements the well-documented Tuya wire format directly (packet framing +
-AES payload encryption) instead of depending on a third-party Tuya SDK, so
-the whole DP <-> entity path stays inspectable end to end - no black box.
+Wire format, all fields big-endian:
 
-Wire format (protocol versions 3.1/3.3), all fields big-endian:
+    0x000055AA | seq(4) | command(4) | length(4) | [retcode(4), receive-only]
+        | payload[...] | crc32(4) or hmac-sha256(32) [3.4 only] | 0x0000AA55
 
-    0x000055AA | seq(4) | command(4) | length(4) | payload[...] | crc32(4) | 0x0000AA55
+Three protocol generations, real differences between them (not just a
+version number):
 
-`length` counts payload + crc32 + suffix (8 bytes). The payload itself is
-AES-128-ECB encrypted with the device's local_key (PKCS7 padded). Protocol
-3.4/3.5 additionally require a session-key handshake (HMAC-SHA256) before
-any DP exchange.
+- **3.1**: CONTROL commands get a bespoke MD5-signature-prefixed,
+  base64-encoded payload instead of a plain header; DP_QUERY is plain.
+- **3.3**: payload is AES-128-ECB encrypted (PKCS7 padded); most commands
+  (CONTROL included) get a 15-byte plaintext version header ("3.3" + 12
+  zero bytes) PREPENDED TO THE CIPHERTEXT - but NOT DP_QUERY/HEART_BEAT.
+- **3.4**: requires a session-key handshake (HMAC-SHA256 nonce exchange,
+  see `_negotiate_session_key`) before any real exchange; the derived
+  session key replaces `local_key` for the rest of the connection. The
+  version header is prepended to the PLAINTEXT (part of what gets
+  encrypted, unlike 3.3), and message framing uses an HMAC-SHA256 (32
+  bytes) instead of a CRC32 (4 bytes) for integrity. DP_QUERY/CONTROL are
+  sent as DP_QUERY_NEW/CONTROL_NEW instead, with different payload shapes
+  (CONTROL_NEW nests the DPs under `data.dps`).
 
-Verified against localtuya's real implementation
-(custom_components/localtuya/pytuya/__init__.py) after live-device reports
-surfaced two real bugs this fixed:
-
-- Protocol 3.3 prepends a 15-byte plaintext header (`b"3.3" + 12 zero
-  bytes`) to the CIPHERTEXT of most commands (CONTROL included) - but NOT
-  DP_QUERY/HEART_BEAT. This was missing entirely on the send side (would
-  have broken every set_dps() control command on a real 3.3 device) and
-  unhandled on the receive side (an incoming push/reply carrying it would
-  fail to decrypt). Both fixed, symmetric header-prepend/strip.
-- DP_QUERY's payload needs FOUR fields (gwId/devId/uid/t), not two
-  (gwId/devId) - a real AC closed the connection outright on the
-  incomplete request ("Connection lost").
-
-Known limitation, honestly narrower than it first looks: **protocol 3.1's
-CONTROL command uses a DIFFERENT mechanism entirely** (an MD5-hexdigest
-signature prefix instead of the plain 15-byte header 3.3 uses) which is
-NOT implemented here - only 3.1's DP_QUERY (status reads) has been
-verified correct-in-principle against the reference; sending commands
-(turning something on/off) to a 3.1 device is unverified and likely
-broken until that MD5 path is added. 3.3 is the one that's been checked
-against a live device end to end. Protocol 3.4/3.5's session-key handshake
-is NOT implemented at all yet - most Tuya devices manufactured before
-~2022 use 3.1/3.3. Attempting to use protocol_version="3.4" raises
-NotImplementedError with a clear message rather than failing silently.
+Known limitation, honestly narrower than it first looks: 3.1's CONTROL
+signature scheme is ported but has never been exercised against a real
+3.1 device (all live reports so far have been 3.3/3.4 devices). 3.4 is a
+careful, complete port of the reference's handshake and framing, verified
+here with direct crypto/framing round-trip tests (mirroring exactly what
+localtuya's own functions produce), but - like everything protocol-level
+in this project - has not been confirmed end-to-end against a real 3.4
+device from this sandbox (no live network access). Report back if a real
+3.4 device still doesn't work; the discrepancy is narrowed to "this port
+has a mistake" rather than "3.4 isn't attempted at all".
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import hashlib
+import hmac
 import json
 import logging
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from Crypto.Cipher import AES
@@ -54,36 +60,53 @@ from Crypto.Util.Padding import pad, unpad
 
 _LOGGER = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Wire constants - names/values match localtuya's pytuya/__init__.py exactly
+# ---------------------------------------------------------------------------
 PREFIX = 0x000055AA
 SUFFIX = 0x0000AA55
-HEADER_SIZE = 16  # prefix+seq+command+length
-FOOTER_SIZE = 8  # crc32+suffix
+HEADER_SIZE = 16  # prefix(4)+seq(4)+command(4)+length(4)
+RETCODE_SIZE = 4  # receive-only, see tuya_lan.py's earlier v0.2.7 fix
+FOOTER_SIZE = 8  # crc32(4)+suffix(4) - protocol 3.1/3.3
+FOOTER_SIZE_HMAC = 36  # hmac-sha256(32)+suffix(4) - protocol 3.4 only
 
-CMD_STATUS = 0x0A  # DP_QUERY
-CMD_CONTROL = 0x07  # CONTROL (set DPs)
+CMD_CONTROL = 0x07
 CMD_HEARTBEAT = 0x09
+CMD_STATUS = 0x0A  # a.k.a. "DP_QUERY" in the reference - kept this name
+# for the rest of this codebase, which predates this port
+CMD_SESS_KEY_NEG_START = 0x03
+CMD_SESS_KEY_NEG_RESP = 0x04
+CMD_SESS_KEY_NEG_FINISH = 0x05
+CMD_CONTROL_NEW = 0x0D  # protocol 3.4's CONTROL
+CMD_DP_QUERY_NEW = 0x10  # protocol 3.4's DP_QUERY
+
+# Commands that do NOT get the 3.3/3.4 plaintext version header prepended.
+_NO_HEADER_CMDS = frozenset(
+    {
+        CMD_STATUS,
+        CMD_DP_QUERY_NEW,
+        CMD_HEARTBEAT,
+        CMD_SESS_KEY_NEG_START,
+        CMD_SESS_KEY_NEG_RESP,
+        CMD_SESS_KEY_NEG_FINISH,
+    }
+)
+
+_VERSION_HEADER_TAIL = b"\x00" * 12  # follows the "3.3"/"3.4" version bytes
 
 # How often to ping the device to keep the TCP connection (and this
 # project's whole "reactive, not polling" design - see coordinator.py -
 # which depends on that connection staying open to receive unsolicited
-# push updates) alive. Matches localtuya's own HEARTBEAT_INTERVAL exactly.
+# push updates) alive. Matches the reference's own HEARTBEAT_INTERVAL.
 HEARTBEAT_INTERVAL = 10
-
-# Protocol 3.2+/3.3 prepends this 15-byte header to the CIPHERTEXT of most
-# commands (CONTROL included) - but NOT DP_QUERY/HEART_BEAT. See
-# _send_receive()'s comment for how this was found (diffed against
-# localtuya's real pytuya implementation) and why it matters.
-_VERSION_33_HEADER = b"3.3" + b"\x00" * 12
 
 
 def _crc32(data: bytes) -> int:
-    import binascii
-
     return binascii.crc32(data) & 0xFFFFFFFF
 
 
 class TuyaProtocolError(Exception):
-    """Raised on malformed/undecryptable packets."""
+    """Raised on malformed/undecryptable packets, or a failed handshake."""
 
 
 @dataclass
@@ -105,15 +128,22 @@ class TuyaLocalDevice:
         port: int = 6668,
         on_update: Callable[[dict[int, Any]], None] | None = None,
     ) -> None:
-        if protocol_version not in ("3.1", "3.3"):
+        if protocol_version not in ("3.1", "3.3", "3.4"):
             raise NotImplementedError(
-                f"Tuya protocol {protocol_version} is not implemented yet "
-                "(only 3.1 and 3.3 are supported in this version)."
+                f"Tuya protocol {protocol_version} is not implemented "
+                "(supported: 3.1, 3.3, 3.4)."
             )
         self.device_id = device_id
         self.address = address
-        self.local_key = local_key.encode("utf-8")
+        self.real_local_key = local_key.encode("utf-8")
+        # For 3.4 this gets REPLACED by the negotiated session key once
+        # connect() completes the handshake; for 3.1/3.3 it always equals
+        # real_local_key. Every encrypt/decrypt uses whatever this
+        # currently holds - see _cipher().
+        self.local_key = self.real_local_key
         self.protocol_version = protocol_version
+        self.version_bytes = protocol_version.encode("latin1")
+        self.version_header = self.version_bytes + _VERSION_HEADER_TAIL
         self.port = port
         self._on_update = on_update
         self._seq = 0
@@ -122,22 +152,25 @@ class TuyaLocalDevice:
         self._listen_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future] = {}
+        # Command-keyed (not seq-keyed) waiters - only used during the 3.4
+        # handshake, where the reference itself doesn't trust seqno
+        # matching yet (see _negotiate_session_key's docstring).
+        self._pending_cmd: dict[int, asyncio.Future] = {}
         self._lock = asyncio.Lock()
+        # 3.4 session-key negotiation state. The fixed nonce matches the
+        # reference implementation exactly - security here rests on the
+        # local_key's secrecy plus the HMAC exchange, not nonce randomness.
+        self._local_nonce = b"0123456789abcdef"
+        self._remote_nonce = b""
 
     # -- connection lifecycle -------------------------------------------------
     async def connect(self, timeout: float = 5.0, retries: int = 3) -> None:
-        # Real report: a fresh connect() to a just-discovered device (an
-        # irrigation valve, found seconds earlier by active_scan.py's own
-        # identify step) failed outright with ConnectionResetError. Cheap
-        # embedded Tuya devices commonly have a very limited TCP stack and
-        # can reject/reset a new connection attempt for a short cooldown
-        # right after a previous one closed - plausible here since
-        # active_scan.py connects+closes its own probe connection to the
-        # same device shortly before the real pairing connect happens.
-        # Retrying with a short backoff is standard, defensive handling
-        # for exactly this kind of flaky embedded-device behavior, not a
-        # protocol bug to "fix" - there's nothing wrong to decode/encode
-        # differently here.
+        # Real report: a fresh connect() to a just-discovered device failed
+        # outright with ConnectionResetError. Cheap embedded Tuya devices
+        # commonly have a very limited TCP stack and can reject a new
+        # connection for a short cooldown right after a previous one
+        # closed. Retrying with a short backoff is standard, defensive
+        # handling for this - not a protocol bug to "fix".
         last_err: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
@@ -161,19 +194,16 @@ class TuyaLocalDevice:
                 await asyncio.sleep(delay)
         else:  # pragma: no cover - defensive, loop always breaks or raises
             raise last_err
+
+        self._seq = 0
         self._listen_task = asyncio.ensure_future(self._listen())
-        # GAP FIXED HERE (found reviewing localtuya's pytuya/__init__.py's
-        # TuyaProtocol.start_heartbeat()): without a periodic HEART_BEAT,
-        # a real device can silently drop this TCP connection after a
-        # short idle period - the CMD_HEARTBEAT constant existed but was
-        # never actually sent anywhere. Reconnecting lazily on the next
-        # status()/set_dps() call still works, but every idle-then-dropped
-        # gap means missing whatever unsolicited push updates would have
-        # arrived on the (now-closed) connection in between - directly
-        # undermining this project's "reactive, not polling" design
-        # (coordinator.py), silently degrading it to poll-only whenever
-        # the device's own idle-timeout is shorter than the coordinator's
-        # scan_interval (30s default).
+
+        if self.protocol_version == "3.4":
+            ok = await self._negotiate_session_key()
+            if not ok:
+                await self.close()
+                raise TuyaProtocolError(f"{self.device_id}: 3.4 session key negotiation failed")
+
         self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
 
     async def close(self) -> None:
@@ -183,14 +213,24 @@ class TuyaLocalDevice:
             self._heartbeat_task.cancel()
         if self._writer:
             self._writer.close()
+        self.local_key = self.real_local_key  # reset any negotiated 3.4 session key
+
+    @property
+    def connected(self) -> bool:
+        return self._writer is not None and not self._writer.is_closing()
 
     async def heartbeat(self) -> None:
-        """Send one HEART_BEAT - matches the reference's 2-field payload
-        (gwId/devId only, unlike DP_QUERY's 4-field one)."""
         obj = {"gwId": self.device_id, "devId": self.device_id}
-        await self._send_receive(CMD_HEARTBEAT, obj)
+        await self._send_receive_json(CMD_HEARTBEAT, obj)
 
     async def _heartbeat_loop(self) -> None:
+        # GAP FIXED HERE (found reviewing the reference's
+        # TuyaProtocol.start_heartbeat()): without a periodic HEART_BEAT, a
+        # real device can silently drop the TCP connection after a short
+        # idle period - directly undermining this project's "reactive, not
+        # polling" design (coordinator.py), since a dropped connection
+        # misses whatever unsolicited push updates would have arrived on
+        # it until the next lazy reconnect.
         try:
             while True:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -207,97 +247,185 @@ class TuyaLocalDevice:
         if self._writer:
             self._writer.close()
 
-    @property
-    def connected(self) -> bool:
-        return self._writer is not None and not self._writer.is_closing()
-
     # -- public API -------------------------------------------------------------
     async def status(self) -> dict[int, Any]:
-        """Query current DP values (command DP_QUERY, 0x0A)."""
-        # BUG FIXED HERE (found by diffing against localtuya's real
-        # pytuya/__init__.py `payload_dict`): DP_QUERY's expected payload
-        # for the default ("type_0a") device profile is FOUR fields -
-        # gwId, devId, uid, t (timestamp) - this only ever sent two
-        # (gwId, devId). A device receiving an incomplete DP_QUERY request
-        # can reject/close the connection outright rather than reply -
-        # surfaced as "Could not reach device on LAN: Connection lost"
-        # on a live AC. `uid` follows the same convention already used
-        # (correctly) in set_dps() below: falls back to device_id.
-        #
-        # (A prior bug here - pre-encoding the payload to bytes before
-        # calling _send_receive(), which double-JSON-encoded it - was
-        # fixed separately; this is a second, independent bug in what
-        # fields the payload actually needs.)
-        obj = {
-            "gwId": self.device_id,
-            "devId": self.device_id,
-            "uid": self.device_id,
-            "t": str(int(time.time())),
-        }
-        reply = await self._send_receive(CMD_STATUS, obj)
+        """Query current DP values."""
+        if self.protocol_version == "3.4":
+            # 3.4 uses DP_QUERY_NEW with a 3-field payload (no gwId) -
+            # ported from the reference's "v3.4" payload_dict override.
+            obj = {"devId": self.device_id, "uid": self.device_id, "t": int(time.time())}
+            reply = await self._send_receive_json(CMD_DP_QUERY_NEW, obj)
+        else:
+            # BUG FIXED HERE (found by diffing against the reference's
+            # payload_dict): the default device profile's DP_QUERY payload
+            # needs FOUR fields - gwId, devId, uid, t - not two. A device
+            # receiving an incomplete request can reject/close the
+            # connection outright ("Connection lost" on a live AC).
+            obj = {
+                "gwId": self.device_id,
+                "devId": self.device_id,
+                "uid": self.device_id,
+                "t": str(int(time.time())),
+            }
+            reply = await self._send_receive_json(CMD_STATUS, obj)
         return _extract_dps(reply)
 
     async def set_dps(self, dps: dict[int, Any]) -> dict[int, Any]:
-        """Set one or more datapoints (command CONTROL, 0x07)."""
-        # BUG FIXED HERE (same diffing pass that found the heartbeat gap):
-        # the reference's CONTROL payload template is exactly
-        # devId/uid/t/dps - NOT gwId/devId/uid/t/dps. This sent an extra,
-        # unexpected `gwId` field on every set_dps() call - never verified
-        # against a live device actually accepting a control command (the
-        # DP_QUERY bug blocked pairing before any control command was ever
-        # tried for real), so this may well be why. Matching the reference
-        # exactly now rather than leaving an unverified extra field in.
-        payload = {
-            "devId": self.device_id,
-            "uid": self.device_id,
-            "t": str(int(time.time())),
-            "dps": {str(k): v for k, v in dps.items()},
-        }
-        reply = await self._send_receive(CMD_CONTROL, payload)
+        """Set one or more datapoints."""
+        dps_str_keyed = {str(k): v for k, v in dps.items()}
+        if self.protocol_version == "3.4":
+            # 3.4 uses CONTROL_NEW: dps nested under "data", "t" as a real
+            # int (not a string) - ported from the reference's "v3.4"
+            # payload_dict override, distinct from 3.1/3.3's flat shape.
+            obj: dict[str, Any] = {"protocol": 5, "t": int(time.time()), "data": {"dps": dps_str_keyed}}
+            reply = await self._send_receive_json(CMD_CONTROL_NEW, obj)
+        else:
+            # BUG FIXED HERE (same diffing pass as the DP_QUERY fix): the
+            # reference's CONTROL payload template is exactly
+            # devId/uid/t/dps - NOT gwId/devId/uid/t/dps.
+            obj = {
+                "devId": self.device_id,
+                "uid": self.device_id,
+                "t": str(int(time.time())),
+                "dps": dps_str_keyed,
+            }
+            reply = await self._send_receive_json(CMD_CONTROL, obj)
         return _extract_dps(reply)
 
+    # -- 3.4 session-key handshake -----------------------------------------------
+    async def _negotiate_session_key(self) -> bool:
+        """Port of the reference's `_negotiate_session_key`. Waits for the
+        SESS_KEY_NEG_RESP reply by COMMAND, not by echoed sequence number -
+        matching the reference's own design (its comment: real 3.4 devices
+        don't reliably echo the expected seqno for this specific exchange,
+        so it deliberately doesn't rely on that here, unlike every other
+        exchange)."""
+        self.local_key = self.real_local_key
+
+        try:
+            reply = await self._send_receive_raw(
+                CMD_SESS_KEY_NEG_START, self._local_nonce, wait_cmd=CMD_SESS_KEY_NEG_RESP
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.debug("%s: 3.4 session key negotiation step 1 timed out", self.device_id)
+            return False
+
+        if not reply.payload or len(reply.payload) < 48:
+            _LOGGER.debug("%s: 3.4 session key negotiation step 2 failed (short/no response)", self.device_id)
+            return False
+
+        try:
+            decrypted = self._decrypt_raw(reply.payload)
+        except (ValueError, KeyError) as err:
+            _LOGGER.debug("%s: 3.4 session key negotiation step 2 decrypt failed: %s", self.device_id, err)
+            return False
+
+        if len(decrypted) < 48:
+            _LOGGER.debug("%s: 3.4 session key negotiation step 2 response too short", self.device_id)
+            return False
+
+        self._remote_nonce = decrypted[:16]
+        hmac_check = hmac.new(self.local_key, self._local_nonce, hashlib.sha256).digest()
+        if hmac_check != decrypted[16:48]:
+            # Non-fatal in the reference too (logged, not aborted) - the
+            # HMAC-FINISH step below is the real integrity confirmation.
+            _LOGGER.debug("%s: 3.4 session key negotiation HMAC check mismatch", self.device_id)
+
+        rkey_hmac = hmac.new(self.local_key, self._remote_nonce, hashlib.sha256).digest()
+        # FINISH is fire-and-forget in the reference (recv_retries=None ->
+        # its wait loop never actually runs) - no reply expected/awaited.
+        await self._send_only(CMD_SESS_KEY_NEG_FINISH, rkey_hmac)
+
+        xored = bytes(a ^ b for a, b in zip(self._local_nonce, self._remote_nonce))
+        # NOT padded (pad=False in the reference) - the XOR result is
+        # already exactly 16 bytes, one AES block.
+        self.local_key = self._encrypt_raw(xored, pad_data=False)
+        _LOGGER.debug("%s: 3.4 session key negotiated successfully", self.device_id)
+        return True
+
     # -- wire-level helpers -------------------------------------------------------
+    def _cipher(self) -> AES:
+        return AES.new(self.local_key, AES.MODE_ECB)
+
+    def _encrypt_raw(self, data: bytes, pad_data: bool = True) -> bytes:
+        cipher = self._cipher()
+        return cipher.encrypt(pad(data, 16) if pad_data else data)
+
+    def _decrypt_raw(self, data: bytes) -> bytes:
+        cipher = self._cipher()
+        return unpad(cipher.decrypt(data), 16)
+
     def _build_payload(self, obj: dict[str, Any]) -> bytes:
         return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
-    def _encrypt(self, data: bytes) -> bytes:
-        cipher = AES.new(self.local_key, AES.MODE_ECB)
-        return cipher.encrypt(pad(data, 16))
+    def _encode_message(self, command: int, raw_payload: bytes) -> tuple[bytes, int, bytes | None]:
+        """Version-aware framing, ported from the reference's
+        `_encode_message`. Returns (wire_bytes, seq, hmac_key_used)."""
+        hmac_key: bytes | None = None
+        payload = raw_payload
 
-    def _decrypt(self, data: bytes) -> bytes:
-        cipher = AES.new(self.local_key, AES.MODE_ECB)
-        return unpad(cipher.decrypt(data), 16)
+        if self.protocol_version == "3.4":
+            hmac_key = self.local_key
+            if command not in _NO_HEADER_CMDS:
+                # 3.4: header goes into the PLAINTEXT (encrypted together
+                # with the payload) - different from 3.3, where the header
+                # is prepended to the already-encrypted ciphertext.
+                payload = self.version_header + payload
+            payload = self._encrypt_raw(payload, pad_data=True)
+        elif self.protocol_version == "3.3":
+            # BUG FIXED HERE (found by diffing against the reference):
+            # this header was missing entirely on both send and receive
+            # for a long time - every set_dps() control command would
+            # have been malformed on a real 3.3 device.
+            payload = self._encrypt_raw(payload, pad_data=True)
+            if command not in _NO_HEADER_CMDS:
+                payload = self.version_header + payload
+        else:  # 3.1
+            if command == CMD_CONTROL:
+                enc = self._encrypt_raw(payload, pad_data=True)
+                enc_b64 = base64.b64encode(enc)
+                pre_md5 = b"data=" + enc_b64 + b"||lpv=3.1||" + self.real_local_key
+                digest = hashlib.md5(pre_md5).hexdigest()
+                payload = b"3.1" + digest[8:24].encode("latin1") + enc_b64
+            else:
+                payload = self._encrypt_raw(payload, pad_data=True)
 
-    def _frame(self, seq: int, command: int, payload: bytes) -> bytes:
-        length = len(payload) + FOOTER_SIZE
-        header = struct.pack(">IIII", PREFIX, seq, command, length)
+        self._seq += 1
+        seq = self._seq
+        return self._pack(seq, command, payload, hmac_key), seq, hmac_key
+
+    def _pack(self, seq: int, command: int, payload: bytes, hmac_key: bytes | None) -> bytes:
+        footer_len = FOOTER_SIZE_HMAC if hmac_key else FOOTER_SIZE
+        header = struct.pack(">IIII", PREFIX, seq, command, len(payload) + footer_len)
         body = header + payload
+        if hmac_key:
+            mac = hmac.new(hmac_key, body, hashlib.sha256).digest()
+            return body + struct.pack(">32sI", mac, SUFFIX)
         crc = _crc32(body)
         return body + struct.pack(">II", crc, SUFFIX)
 
-    async def _send_receive(self, command: int, obj: dict[str, Any]) -> TuyaMessage:
+    async def _send_only(self, command: int, raw_payload: bytes) -> None:
+        packet, _seq, _hmac_key = self._encode_message(command, raw_payload)
+        async with self._lock:
+            self._writer.write(packet)
+            await self._writer.drain()
+
+    async def _send_receive_json(self, command: int, obj: dict[str, Any]) -> TuyaMessage:
+        return await self._send_receive_raw(command, self._build_payload(obj))
+
+    async def _send_receive_raw(
+        self, command: int, raw_payload: bytes, wait_cmd: int | None = None
+    ) -> TuyaMessage:
         if not self.connected:
             await self.connect()
-        self._seq += 1
-        seq = self._seq
-        raw = self._build_payload(obj)
-        enc = self._encrypt(raw)
-        # BUG FIXED HERE (found by diffing against localtuya's real
-        # pytuya/__init__.py): protocol 3.2+/3.3 requires a 15-byte
-        # version header (b"3.3" + 12 zero bytes) PREPENDED TO THE
-        # CIPHERTEXT for most commands - but NOT for DP_QUERY/HEART_BEAT,
-        # which go out as plain ciphertext. This was missing entirely, so
-        # CONTROL (set_dps) commands on a real 3.3 device were malformed -
-        # the device would very likely reject/ignore them (this integration
-        # never got far enough to report that specific symptom yet, since
-        # the DP_QUERY payload bug below blocked pairing before any
-        # set_dps() call was ever attempted against a real device).
-        if self.protocol_version == "3.3" and command not in (CMD_STATUS, CMD_HEARTBEAT):
-            enc = _VERSION_33_HEADER + enc
-        packet = self._frame(seq, command, enc)
+        packet, seq, _hmac_key = self._encode_message(command, raw_payload)
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[seq] = fut
+        if wait_cmd is not None:
+            self._pending_cmd[wait_cmd] = fut
+        else:
+            self._pending[seq] = fut
+
         async with self._lock:
             self._writer.write(packet)
             await self._writer.drain()
@@ -305,6 +433,8 @@ class TuyaLocalDevice:
             return await asyncio.wait_for(fut, timeout=10)
         finally:
             self._pending.pop(seq, None)
+            if wait_cmd is not None:
+                self._pending_cmd.pop(wait_cmd, None)
 
     async def _listen(self) -> None:
         """Background reader - also delivers unsolicited status pushes."""
@@ -316,25 +446,22 @@ class TuyaLocalDevice:
                     break
                 buf += chunk
                 while True:
-                    msg, consumed = _try_parse(buf)
-                    if msg is None:
+                    frame, consumed = _try_parse(buf, hmac_framed=self.protocol_version == "3.4")
+                    if frame is None:
                         break
                     buf = buf[consumed:]
-                    try:
-                        raw = msg.payload
-                        # Symmetric with _send_receive()'s header-prepend:
-                        # an incoming 3.3 payload may start with the same
-                        # plaintext "3.3"+12 zero bytes header (checked
-                        # BEFORE decrypting, since the header itself isn't
-                        # encrypted) - strip it if present.
-                        if raw[: len(_VERSION_33_HEADER)] == _VERSION_33_HEADER:
-                            raw = raw[len(_VERSION_33_HEADER):]
-                        payload = self._decrypt(raw) if raw else b""
-                        obj = json.loads(payload) if payload else None
-                    except Exception:  # noqa: BLE001 - malformed/heartbeat frame
-                        obj = None
-                    parsed = TuyaMessage(msg.seq, msg.command, obj)
-                    fut = self._pending.get(msg.seq)
+                    obj = self._decode_frame_payload(frame.payload)
+                    parsed = TuyaMessage(frame.seq, frame.command, obj)
+
+                    # Command-sentinel waiters (3.4 handshake) take
+                    # priority - matches the reference's own dispatch order
+                    # for SESS_KEY_NEG_RESP.
+                    cmd_fut = self._pending_cmd.get(frame.command)
+                    if cmd_fut and not cmd_fut.done():
+                        cmd_fut.set_result(TuyaMessage(frame.seq, frame.command, frame.payload))
+                        continue
+
+                    fut = self._pending.get(frame.seq)
                     if fut and not fut.done():
                         fut.set_result(parsed)
                     elif obj and self._on_update:
@@ -344,6 +471,45 @@ class TuyaLocalDevice:
         except (asyncio.CancelledError, ConnectionResetError, OSError):
             pass
 
+    def _decode_frame_payload(self, raw: bytes) -> dict | None:
+        """Version-aware payload decode, ported from the reference's
+        `_decode_payload`. For 3.4 the whole payload (header included) is
+        encrypted together - decrypt FIRST, then strip the now-plaintext
+        version header if present. For 3.1/3.3 the header (if any) is
+        OUTSIDE the encryption - strip first, then decrypt."""
+        if not raw:
+            return None
+        try:
+            if self.protocol_version == "3.4":
+                decrypted = self._decrypt_raw(raw)
+                if decrypted.startswith(self.version_bytes):
+                    decrypted = decrypted[len(self.version_header) :]
+                text = decrypted.decode("utf-8")
+            elif self.protocol_version == "3.1" and raw.startswith(b"3.1"):
+                # skip "3.1" (3 bytes) + 16-byte MD5-hexdigest signature
+                text = self._decrypt_raw(raw[19:]).decode("utf-8")
+            else:  # 3.3 (or 3.1 non-CONTROL replies, same shape as 3.3)
+                payload = raw
+                if payload[: len(self.version_header)] == self.version_header:
+                    payload = payload[len(self.version_header) :]
+                if payload[:1] == b"{" and payload[-1:] == b"}":
+                    text = payload.decode("utf-8")  # already-plaintext ack/edge case
+                else:
+                    text = self._decrypt_raw(payload).decode("utf-8")
+        except Exception:  # noqa: BLE001 - malformed/heartbeat-ack/undecodable frame
+            return None
+
+        try:
+            obj = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        # 3.4 CONTROL_NEW replies nest dps under "data" - unwrap so
+        # _extract_dps doesn't need to know which protocol generation sent it.
+        if isinstance(obj, dict) and "dps" not in obj and isinstance(obj.get("data"), dict):
+            if "dps" in obj["data"]:
+                obj["dps"] = obj["data"]["dps"]
+        return obj
+
 
 @dataclass
 class _RawFrame:
@@ -352,29 +518,16 @@ class _RawFrame:
     payload: bytes
 
 
-def _try_parse(buf: bytes) -> tuple[_RawFrame | None, int]:
-    """Parse ONE incoming (device -> us) frame.
+def _try_parse(buf: bytes, hmac_framed: bool) -> tuple[_RawFrame | None, int]:
+    """Parse ONE incoming (device -> us) frame. `hmac_framed` selects the
+    36-byte HMAC-SHA256 footer (protocol 3.4) vs the 8-byte CRC32 footer
+    (3.1/3.3) - the two are NOT distinguishable from the header alone, the
+    caller must know which protocol this connection is using.
 
-    FUNDAMENTAL BUG FIXED HERE (found by diffing against localtuya's real
-    `unpack_message()`): a message the DEVICE sends carries a 4-byte
-    `retcode` field between the header and the encrypted payload - present
-    on every real reply/push, but absent from what WE send (our own
-    `_frame()`/send-side header is correctly retcode-less, matching the
-    reference's send-side `MESSAGE_HEADER_FMT`). This function used the
-    same 16-byte header with NO retcode skip for parsing INCOMING frames
-    too, so every decrypt attempt started 4 bytes too early (into the
-    retcode, not the ciphertext) and ran 4 bytes too long - silently
-    caught by _listen()'s broad except and discarded as an unparseable
-    frame. Net effect: DP_QUERY replies and ALL push updates were corrupt
-    from the very first byte, forever - status() never raised or timed
-    out (the sequence number still matched, so the waiting future still
-    resolved), it just always resolved to an EMPTY dps dict. This is the
-    real reason every entity showed no current value with no visible
-    error, independent of (and more fundamental than) the DP_QUERY
-    payload-field and coordinator-merge fixes from the same investigation.
-
-    `length` (parsed from the header) counts retcode(4) + payload + crc/
-    suffix(8) - i.e. everything after the 16-byte header.
+    `length` (parsed from the header) counts retcode(4) + payload +
+    footer - i.e. everything after the 16-byte header. The retcode field
+    is present only on frames the DEVICE sends (see the v0.2.7 fix this
+    generalizes) - our own outgoing frames never include one.
     """
     if len(buf) < HEADER_SIZE:
         return None, 0
@@ -384,15 +537,17 @@ def _try_parse(buf: bytes) -> tuple[_RawFrame | None, int]:
     total = HEADER_SIZE + length
     if len(buf) < total:
         return None, 0
-    retcode_size = 4
-    payload_len = length - retcode_size - FOOTER_SIZE
-    payload_start = HEADER_SIZE + retcode_size
-    payload = buf[payload_start : payload_start + payload_len]
+    footer_size = FOOTER_SIZE_HMAC if hmac_framed else FOOTER_SIZE
+    payload_len = length - RETCODE_SIZE - footer_size
+    payload_start = HEADER_SIZE + RETCODE_SIZE
+    payload = buf[payload_start : payload_start + max(payload_len, 0)]
     return _RawFrame(seq, command, payload), total
 
 
 def _extract_dps(msg: TuyaMessage) -> dict[int, Any]:
     if not msg.payload:
         return {}
-    dps = msg.payload.get("dps", {})
+    dps = msg.payload.get("dps")
+    if not dps:
+        return {}
     return {int(k): v for k, v in dps.items()}

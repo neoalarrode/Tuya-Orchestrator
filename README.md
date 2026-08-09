@@ -138,14 +138,19 @@ configurado, es 100% LAN, nunca vuelve a llamar a la nube.
 mismo menú inicial, si ya conocés IP/`device_id`/`local_key` (por ejemplo
 vía `tinytuya wizard`) y no querés pasar por el descubrimiento.
 
-## Estado actual (v0.2.0)
+## Estado actual (v0.5.0)
 
-- ✅ Protocolo LAN implementado directamente (framing + AES-ECB), versiones
-  **3.1 y 3.3**.
-- ❌ **3.4/3.5 (handshake HMAC de sesión) todavía no implementado** — la
-  mayoría de dispositivos Tuya fabricados desde ~2022 usan 3.4/3.5. Un
-  dispositivo descubierto con esa versión aborta el alta con un mensaje
-  claro en vez de crear una entrada rota.
+- ✅ Protocolo LAN portado directamente de
+  [localtuya](https://github.com/rospogrigio/localtuya) (no reinventado),
+  versiones **3.1, 3.3 y 3.4** — 3.4 incluye la negociación completa de
+  clave de sesión (HMAC-SHA256). Solo **3.5** queda sin implementar.
+- ⚠️ 3.4 verificado con una simulación completa del handshake (dispositivo
+  falso calculando su lado del intercambio de forma independiente), pero
+  **sin confirmar todavía contra un dispositivo 3.4 real** — reportá si
+  alguno sigue sin andar. El `CONTROL` de 3.1 (firma MD5) está portado
+  pero tampoco verificado contra un dispositivo 3.1 real.
+- ✅ Descubrimiento activo (`active_scan.py`) prueba tanto 3.3 como 3.4 al
+  identificar un dispositivo, nunca asume uno solo.
 - ✅ Plataformas: `switch`, `sensor`, `number`, `binary_sensor`, `select`,
   `light` (brillo + temperatura de color + HSV, sin RGB por JSON en LAN
   aún sin verificar), `climate`, `vacuum`.
@@ -207,7 +212,11 @@ dispositivo real — ver el caveat en `profile.py` (`LightMapping`).
 
 ## Próximos pasos sugeridos
 
-- Implementar protocolo 3.4/3.5 (handshake HMAC) — bloqueante para la
-  mayoría de dispositivos modernos.
+- Confirmar protocolo 3.4 contra un dispositivo real (por ahora solo
+  verificado con simulación completa del handshake).
+- Implementar protocolo 3.5 si aparece un dispositivo que lo necesite.
+- Decodificar broadcast de descubrimiento en formato `0x6699` (dispositivos
+  3.4 nuevos) — hoy el descubrimiento activo ya los encuentra igual, sin
+  depender del broadcast.
 - Sumar más perfiles built-in a medida que se prueben dispositivos reales.
-- `light`/`climate`/`cover` cuando haga falta.
+- `cover` cuando haga falta.

@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.5.0 - protocol 3.4 support, ported directly from localtuya
+
+At the user's explicit request ("tienes que basar el código en
+localtuya"/"trabajar basando el código en localtuya") after RGBCW lights
+kept showing every DP as unknown even after all prior fixes: `tuya_lan.py`
+is now a careful, direct PORT of localtuya's real
+`custom_components/localtuya/pytuya/__init__.py`, not a from-scratch
+reimplementation being incrementally patched. Rewrote the whole module
+around the reference's actual wire logic rather than re-deriving it.
+
+**Real, working reason this matters**: protocol 3.4 was previously not
+implemented at all (`NotImplementedError`) - discovery would either abort
+outright (passive path, since v0.2.4) or, worse, active_scan.py
+(v0.4.0) **hardcoded a 3.3 probe unconditionally**, meaning a 3.4 device
+sitting behind a matching TCP port could still get "identified" and
+paired under a wrong protocol assumption depending on how the device
+responded to malformed 3.3-shaped traffic - explaining "connects but
+every value is unknown" with no visible error, exactly the RGBCW light
+symptom. Many modern Tuya RGBCW bulbs are 3.4-only.
+
+**What's newly implemented, ported faithfully from the reference:**
+- Full 3.4 session-key handshake (`_negotiate_session_key`): nonce
+  exchange + HMAC-SHA256 verification + XOR + AES-derive the session key
+  that replaces `local_key` for the rest of the connection.
+- 3.4's distinct message framing: the plaintext version header is baked
+  INTO the encryption (unlike 3.3, where it's prepended to the
+  ciphertext afterward), and the message footer is an HMAC-SHA256 (32
+  bytes) instead of a CRC32 (4 bytes).
+- 3.4's different command set: DP_QUERY_NEW/CONTROL_NEW replace
+  DP_QUERY/CONTROL, with CONTROL_NEW nesting the actual dps under a
+  `data` key and using a real int timestamp instead of a string.
+- `active_scan.py` now probes both 3.3 and 3.4 for every not-yet-found
+  device (previously hardcoded 3.3 only) and reports back whichever
+  version actually identified it - `account.py` uses that real detected
+  version instead of assuming one.
+- `config_flow.py`'s discovery guard no longer aborts on a 3.4-reported
+  broadcast version - only 3.5 (a different, still genuinely unimplemented
+  device family) does now.
+
+**Verified without a live 3.4 device** (none reachable from this
+sandbox) via a full simulated handshake: a fake "device" endpoint
+computing its side of the nonce/HMAC exchange independently confirms the
+client derives the exact same session key, then a simulated
+DP_QUERY_NEW/CONTROL_NEW round trip using that session key decodes
+correctly - plus the pre-existing 3.3 send/receive framing tests, rerun
+against the rewritten module to confirm the port didn't regress anything
+already working. Still the same honest caveat as everywhere else in this
+project: simulated crypto/framing correctness is not the same as a
+confirmed live device exchange - report back if a real 3.4 device still
+doesn't work, this at least narrows it to "the port has a mistake"
+rather than "3.4 isn't attempted at all". 3.1's CONTROL signature scheme
+remains ported-but-unverified against any real 3.1 device, as before.
+
 ## v0.4.1 - fix: ConnectionResetError on a fresh connect to a just-discovered device
 
 Live report: pairing "WiFi Watering Pump 2" (found via v0.4.0's active

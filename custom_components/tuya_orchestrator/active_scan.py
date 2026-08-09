@@ -91,31 +91,48 @@ async def _sweep_open_hosts(subnet: ipaddress.IPv4Network, port: int) -> list[st
     return found
 
 
-async def _try_identify(ip: str, device_id: str, local_key: str) -> bool:
-    device = TuyaLocalDevice(device_id, ip, local_key, protocol_version="3.3")
-    try:
-        # retries=1: this is a quick probe against a possibly-wrong host,
-        # not the real pairing connection - fail fast here (connect()'s
-        # own retry/backoff, added after a live report, is for the real
-        # connect once a device is actually being paired, not for scanning).
-        await device.connect(timeout=IDENTIFY_TIMEOUT, retries=1)
-        await asyncio.wait_for(device.status(), timeout=IDENTIFY_TIMEOUT)
-        return True
-    except Exception:  # noqa: BLE001 - wrong host/key/offline/anything - just not a match
-        return False
-    finally:
-        await device.close()
-        # Brief cooldown before this host might get probed again with a
-        # different candidate key, or before the real pairing connect()
-        # happens shortly after a match - cheap embedded devices can need
-        # a moment to release a just-closed connection (see connect()'s
-        # retry/backoff docstring for the live report this came from).
-        await asyncio.sleep(0.3)
+# Tried in this order for every candidate: 3.3 is still the most common
+# generation in the wild, but plenty of newer devices (RGBCW bulbs among
+# them, per a live report) are 3.4-only - guessing a single fixed version
+# here would silently mismatch those and either fail to identify them at
+# all, or - worse - "succeed" while actually talking the wrong protocol
+# (which is exactly what produced an "always unknown" symptom before
+# tuya_lan.py's 3.4 support was ported in).
+_PROBE_VERSIONS = ("3.3", "3.4")
 
 
-async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, str]:
+async def _try_identify(ip: str, device_id: str, local_key: str) -> str | None:
+    """Returns the protocol version that successfully identified the
+    device, or None if no version worked against this host."""
+    for version in _PROBE_VERSIONS:
+        device = TuyaLocalDevice(device_id, ip, local_key, protocol_version=version)
+        try:
+            # retries=1: this is a quick probe against a possibly-wrong
+            # host, not the real pairing connection - fail fast here
+            # (connect()'s own retry/backoff, added after a live report,
+            # is for the real connect once a device is actually being
+            # paired, not for scanning).
+            await device.connect(timeout=IDENTIFY_TIMEOUT, retries=1)
+            await asyncio.wait_for(device.status(), timeout=IDENTIFY_TIMEOUT)
+            return version
+        except Exception:  # noqa: BLE001 - wrong host/key/version/offline - just not a match yet
+            continue
+        finally:
+            await device.close()
+            # Brief cooldown before this host might get probed again (a
+            # different protocol version, a different candidate key, or
+            # the real pairing connect() shortly after a match) - cheap
+            # embedded devices can need a moment to release a just-closed
+            # connection (see connect()'s retry/backoff docstring).
+            await asyncio.sleep(0.3)
+    return None
+
+
+async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, tuple[str, str]]:
     """`candidates`: list of {"device_id": ..., "local_key": ...} to look
-    for. Returns {device_id: ip} for every match found."""
+    for. Returns {device_id: (ip, protocol_version)} for every match found -
+    the version comes from whichever probe in `_PROBE_VERSIONS` actually
+    worked, never assumed."""
     loop = asyncio.get_event_loop()
     local_ip = await loop.run_in_executor(None, _guess_local_ip)
     if not local_ip:
@@ -132,15 +149,21 @@ async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, str]:
     open_hosts = await _sweep_open_hosts(subnet, DEFAULT_PORT)
     _LOGGER.debug("Active scan: %d host(s) with port %s open: %s", len(open_hosts), DEFAULT_PORT, open_hosts)
 
-    matches: dict[str, str] = {}
+    matches: dict[str, tuple[str, str]] = {}
     for ip in open_hosts:
         still_needed = [c for c in candidates if c["device_id"] not in matches]
         if not still_needed:
             break
         for candidate in still_needed:
-            if await _try_identify(ip, candidate["device_id"], candidate["local_key"]):
-                matches[candidate["device_id"]] = ip
-                _LOGGER.info("Active scan: identified device %s at %s", candidate["device_id"], ip)
+            version = await _try_identify(ip, candidate["device_id"], candidate["local_key"])
+            if version is not None:
+                matches[candidate["device_id"]] = (ip, version)
+                _LOGGER.info(
+                    "Active scan: identified device %s at %s (protocol %s)",
+                    candidate["device_id"],
+                    ip,
+                    version,
+                )
                 break  # this host matched one device - move on to the next host
 
     return matches
