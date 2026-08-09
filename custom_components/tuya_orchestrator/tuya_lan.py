@@ -65,10 +65,15 @@ _LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 PREFIX = 0x000055AA
 SUFFIX = 0x0000AA55
+PREFIX_BYTES = b"\x00\x00\x55\xaa"  # used to resynchronize a desynced stream
 HEADER_SIZE = 16  # prefix(4)+seq(4)+command(4)+length(4)
 RETCODE_SIZE = 4  # receive-only, see tuya_lan.py's earlier v0.2.7 fix
 FOOTER_SIZE = 8  # crc32(4)+suffix(4) - protocol 3.1/3.3
 FOOTER_SIZE_HMAC = 36  # hmac-sha256(32)+suffix(4) - protocol 3.4 only
+# Same sanity bound the reference's parse_header() uses - real Tuya packets
+# top out somewhere around 300 bytes, so anything past this is corruption
+# or a desynced stream, not a big legitimate frame.
+MAX_PAYLOAD_LEN = 1000
 
 CMD_CONTROL = 0x07
 CMD_HEARTBEAT = 0x09
@@ -290,6 +295,15 @@ class TuyaLocalDevice:
             # it makes "no writer" and "not connected" the same fact.
             self._writer = None
         self._reader = None
+        # Matches the reference's `dispatcher.abort()` on close: release
+        # everyone still waiting on a reply that can no longer arrive,
+        # instead of leaving each to burn its full 10s timeout on a socket
+        # already known to be gone.
+        for fut in (*self._pending.values(), *self._pending_cmd.values()):
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
+        self._pending_cmd.clear()
         self.local_key = self.real_local_key  # reset any negotiated 3.4 session key
 
     async def close(self) -> None:
@@ -330,9 +344,12 @@ class TuyaLocalDevice:
         # it until the next lazy reconnect.
         try:
             while True:
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                # Send first, THEN sleep - the reference's heartbeat_loop
+                # does it in this order, so the connection is proven alive
+                # immediately rather than after a full interval of silence.
                 try:
                     await self.heartbeat()
+                    await asyncio.sleep(HEARTBEAT_INTERVAL)
                 except asyncio.TimeoutError:
                     _LOGGER.debug("%s: heartbeat timed out, closing connection", self.device_id)
                     break
@@ -466,6 +483,20 @@ class TuyaLocalDevice:
         except asyncio.TimeoutError:
             _LOGGER.debug("%s: 3.4 session key negotiation step 1 timed out", self.device_id)
             return False
+
+        # GAP FIXED HERE: the reference adopts the device's sequence number
+        # from this very message, with the reason in its own comment:
+        # "for 3.4 devices, we get the starting seqno with the
+        # SESS_KEY_NEG_RESP message" (`self.seqno = msg.seqno`). A 3.4
+        # device numbers the session from ITS side, so continuing with our
+        # own counter left every subsequent reply carrying a seqno we were
+        # not waiting on - i.e. every command on a 3.4 device timing out,
+        # which is exactly the "unknown state on all values" symptom seen
+        # on the 3.4 bulbs. (`- 1` because our counter pre-increments where
+        # the reference's post-increments; next send lands on reply.seq
+        # either way.)
+        if reply.seq > 0:
+            self._seq = reply.seq - 1
 
         if not reply.payload or len(reply.payload) < 48:
             _LOGGER.debug("%s: 3.4 session key negotiation step 2 failed (short/no response)", self.device_id)
@@ -603,7 +634,30 @@ class TuyaLocalDevice:
                     break
                 buf += chunk
                 while True:
-                    frame, consumed = _try_parse(buf, hmac_framed=self.protocol_version == "3.4")
+                    # BUG FIXED HERE: _try_parse() raises TuyaProtocolError
+                    # on a bad prefix (and now on a corrupt length too), and
+                    # that exception is NOT one of the types caught below -
+                    # so a single malformed or desynced byte run killed this
+                    # task outright, silently (an unretrieved task
+                    # exception). The socket stayed open and `connected`
+                    # stayed True, but nothing was ever read again: every
+                    # command timed out and no push update arrived, with no
+                    # error anywhere pointing at the cause. Resynchronize on
+                    # the next frame boundary instead of dying.
+                    try:
+                        frame, consumed = _try_parse(
+                            buf, hmac_framed=self.protocol_version == "3.4"
+                        )
+                    except TuyaProtocolError as err:
+                        nxt = buf.find(PREFIX_BYTES, 1)
+                        _LOGGER.debug(
+                            "%s: %s - %s",
+                            self.device_id,
+                            err,
+                            "resyncing to next frame" if nxt > 0 else "dropping buffer",
+                        )
+                        buf = buf[nxt:] if nxt > 0 else b""
+                        continue
                     if frame is None:
                         break
                     buf = buf[consumed:]
@@ -622,6 +676,21 @@ class TuyaLocalDevice:
                     if fut and not fut.done():
                         fut.set_result(parsed)
                     elif obj and self._on_update:
+                        # GAP FIXED HERE: the reference resynchronizes its
+                        # sequence counter to the DEVICE's on every
+                        # unsolicited status frame (`_status_update`:
+                        # `if msg.seqno > 0: self.seqno = msg.seqno + 1`).
+                        # The device drives the numbering; without following
+                        # it our counter drifts, replies come back carrying
+                        # seqnos nobody is waiting on, and every command
+                        # then times out - which this integration's
+                        # heartbeat loop reads as a dead connection and
+                        # tears down a healthy socket. (Our counter
+                        # pre-increments where the reference's
+                        # post-increments, so `_seq = seqno` here gives the
+                        # same next-send value as its `seqno + 1`.)
+                        if frame.seq > 0:
+                            self._seq = frame.seq
                         dps = _extract_dps(parsed)
                         if dps:
                             self._on_update(dps)
@@ -720,6 +789,18 @@ def _try_parse(buf: bytes, hmac_framed: bool) -> tuple[_RawFrame | None, int]:
     prefix, seq, command, length = struct.unpack(">IIII", buf[:HEADER_SIZE])
     if prefix != PREFIX:
         raise TuyaProtocolError("bad packet prefix")
+    # BUG FIXED HERE: the reference's parse_header() sanity-checks this and
+    # raises ("Header claims the packet size is over 1000 bytes! It is most
+    # likely corrupt"); this had no such check. A corrupt/desynced length
+    # field made the branch below decide "not enough data yet" and wait for
+    # bytes that are never coming - the receive buffer then NEVER yields
+    # another frame, so every later reply queues up behind the bogus one
+    # and every command times out, while the socket still looks perfectly
+    # healthy. Raising here lets the caller resynchronize instead.
+    if length > MAX_PAYLOAD_LEN:
+        raise TuyaProtocolError(
+            f"header claims a {length}-byte packet - almost certainly corrupt"
+        )
     total = HEADER_SIZE + length
     if len(buf) < total:
         return None, 0
@@ -727,6 +808,20 @@ def _try_parse(buf: bytes, hmac_framed: bool) -> tuple[_RawFrame | None, int]:
     payload_len = length - RETCODE_SIZE - footer_size
     payload_start = HEADER_SIZE + RETCODE_SIZE
     payload = buf[payload_start : payload_start + max(payload_len, 0)]
+
+    # Checksum verification, matching the reference's unpack_message():
+    # note it LOGS a mismatch but still returns the message rather than
+    # discarding it, so this deliberately does the same - a wrong CRC has
+    # never been the reason a frame was unusable in practice, and dropping
+    # it would lose real data the reference would have kept.
+    if not hmac_framed:
+        body = buf[: total - FOOTER_SIZE]
+        (want_crc, suffix) = struct.unpack(">II", buf[total - FOOTER_SIZE : total])
+        if suffix != SUFFIX:
+            _LOGGER.debug("Frame suffix wrong: %08X != %08X", suffix, SUFFIX)
+        if want_crc != _crc32(body):
+            _LOGGER.debug("Frame CRC wrong: %08X != %08X", _crc32(body), want_crc)
+
     return _RawFrame(seq, command, payload), total
 
 

@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.9.0 - the rest of the protocol layer: sequence-number sync and stream robustness
+
+v0.8.0's claim of a complete pass was overstated: three blocks of the
+reference (`pack_message`/`unpack_message`/`parse_header`, the
+`TuyaProtocol` transport callbacks, and `_encode_message`) had been taken
+on trust from earlier partial reviews rather than actually re-read. Read
+properly now. **Five more real differences, four of them bugs:**
+
+1. **Our sequence counter never followed the device's.** The reference
+   resynchronizes on every unsolicited status frame
+   (`_status_update`: `if msg.seqno > 0: self.seqno = msg.seqno + 1`). The
+   device drives the numbering; without following it our counter drifts,
+   replies come back carrying seqnos nobody is waiting on, every command
+   times out - and the heartbeat loop reads those timeouts as a dead
+   connection and tears down a healthy socket. A direct cause of
+   unexplained disconnections. Verified with a test: a device push with
+   seqno 57 now moves our next send to 58.
+2. **Protocol 3.4 never adopted the session's starting seqno.** The
+   reference takes it from the handshake reply, with the reason in its own
+   comment: *"for 3.4 devices, we get the starting seqno with the
+   SESS_KEY_NEG_RESP message"*. Without it every post-handshake reply on a
+   3.4 device carried an unexpected seqno - matching the "unknown state on
+   every value" symptom seen on the 3.4 bulbs.
+3. **A corrupt length field silently froze the connection.** The
+   reference's `parse_header()` rejects packets claiming over 1000 bytes
+   ("most likely corrupt"); this had no such check, so a desynced length
+   made the parser wait for bytes that never come. The receive buffer then
+   never yielded another frame: every later reply queued behind the bogus
+   one and every command timed out, while the socket still looked healthy.
+4. **A malformed byte run killed the listener outright.** `_try_parse()`
+   raises on a bad prefix, and that exception type was not caught by the
+   read loop - so the task died silently as an unretrieved task exception.
+   The socket stayed open and `connected` stayed `True`, but nothing was
+   ever read again, with no error anywhere pointing at the cause. Now
+   resynchronizes to the next frame boundary. Verified with a test that
+   feeds garbage followed by a valid frame.
+5. **Pending waiters were not released on teardown** (the reference's
+   `dispatcher.abort()`), so each burned its full 10s timeout on a socket
+   already known to be gone.
+
+Also aligned: CRC/suffix verification now logged on mismatch (the
+reference logs but still returns the frame, so this deliberately does not
+discard it either), and the heartbeat loop sends before sleeping rather
+than after, proving the connection immediately instead of after a full
+interval of silence.
+
 ## v0.8.0 - full line-by-line diff of the reference protocol layer
 
 The remaining gap: previous versions diffed `discovery.py` and the
