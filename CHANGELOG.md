@@ -31,9 +31,77 @@ Ported localtuya's exact mechanism (`__init__.py`'s `_device_discovered` +
    `async_setup()` that retries `device.connect()` for any configured
    device currently showing `connected == False`.
 
+3. **Immediate reconnect on hearing from a disconnected device**: found
+   on a follow-up line-by-line diff of localtuya's `_device_discovered`,
+   which ends by calling `device.async_connect()` for any device it is
+   not currently connected to - on EVERY broadcast, not only on an IP
+   change. This matters for the common case of a device rebooting while
+   keeping its DHCP lease: the IP-change branch never fires, so without
+   this the device sat disconnected for up to a full 60s until the
+   periodic retry noticed, even though its broadcast was already proof it
+   was back. Now reconnects the moment it's heard.
+
+4. **Connection re-entrancy guard** - and this one was a bug items 1-3
+   actively made WORSE. There are now three independent triggers that can
+   ask for a connection (entry setup, the 60s timer, the broadcast
+   callback), and `connect()` had no guard at all: two of them racing each
+   opened its own socket and its own listen task, while only the
+   last-assigned writer stayed reachable. The orphaned socket kept
+   consuming frames that then never reached the coordinator - which
+   presents as a device that randomly stops updating for no visible
+   reason. localtuya has always guarded this (`async_connect()`:
+   `if not self._is_closing and self._connect_task is None and not
+   self._interface`). Ported as a `_connect_lock` plus an
+   already-connected re-check. Verified: 5 concurrent `connect()` calls
+   now open exactly 1 socket (previously 5).
+5. **`close()` was terminal but used for transient failures**: a failed
+   3.4 handshake called `close()`, which now permanently latches the
+   device closed. Split into `close()` (terminal, for entry unload) and
+   `_teardown()` (drop the socket, stay reconnectable), with the
+   handshake path using the latter. `_teardown()` also clears `_writer`/
+   `_reader` instead of leaving them pointing at dead objects.
+6. **Silent disconnections**: when the heartbeat failed, the old code
+   closed the socket and told nobody - entities kept showing their last
+   known values as though live, indefinitely, until some later poll
+   happened to fail. localtuya dispatches None to its entities at exactly
+   this point (`disconnected()`), marking them unavailable. Added an
+   `_on_disconnect` callback wired to the coordinator's
+   `async_set_update_error`, plus the equivalent "waiting for discovery
+   broadcast" warning - which is now literally accurate, since item 3
+   reconnects on the next broadcast heard.
+
 Together these remove the last real case where "remove and re-add the
 device" was the only fix - that should no longer ever be necessary for a
 device that's genuinely reachable on the LAN.
+
+### Verified differences vs localtuya's `discovery.py` (deliberate, documented)
+
+A line-by-line diff of localtuya's discovery module against this one, so
+the remaining differences are on record rather than assumed away:
+
+- **Ports**: localtuya binds 6666 + 6667. This binds 6666 + 6667 + **7000**
+  (tinytuya's `UDPPORTAPP`). Superset - strictly more devices found.
+- **Frame parsing**: localtuya hardcodes `data[20:-8]` (16-byte header +
+  4-byte retcode, 8-byte footer). This reads the length field from the
+  header instead and slices accordingly - same result on a well-formed
+  packet, but not silently wrong on an unusual one.
+- **Cache freshness**: localtuya's `device_found` stores a device in
+  `self.devices` **only the first time** it is seen (`if gwId not in
+  self.devices`), so its cache holds a device's ORIGINAL IP forever; it
+  relies entirely on the callback for IP changes. This overwrites the
+  cache entry on every broadcast, so the cache itself stays current too -
+  which matters here because `config_flow.py` and `account.py` both read
+  that cache directly (v0.6.0's stale-`discovery_info` fix depends on it).
+- **0x6699 frames**: localtuya would fail to parse these too (no special
+  handling); here they're explicitly detected and debug-logged as a known
+  unimplemented format instead of silently failing. Same capability,
+  clearer diagnostics.
+- **Crypto library**: `cryptography` (localtuya) vs `pycryptodome` (here) -
+  same AES-128-ECB, same `MD5(b"yGAdlopoPVldABfn")` key.
+
+Everything else in the discovery path - persistent listener started once
+at domain setup, `reuse_port=True`, callback on every datagram, close on
+HA stop - matches localtuya's behavior.
 
 ## v0.6.0 - full-project audit: 6 more real bugs, including the actual reason the LAN error persisted
 

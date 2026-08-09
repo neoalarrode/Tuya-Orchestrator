@@ -44,6 +44,16 @@ from .tuya_lan import TuyaLocalDevice
 _LOGGER = logging.getLogger(__name__)
 
 
+async def _async_try_connect(device: TuyaLocalDevice) -> None:
+    """Best-effort reconnect - a failure here is normal (device still
+    booting, briefly unreachable) and is retried by the next broadcast or
+    the next RECONNECT_INTERVAL tick, so it must never raise."""
+    try:
+        await device.connect()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Tuya Orchestrator: reconnect to %s failed: %s", device.device_id, err)
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Called ONCE per HA startup, before any ConfigEntry is set up -
     starts the LAN broadcast listener here so it stays open and
@@ -72,17 +82,42 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         for entry in hass.config_entries.async_entries(DOMAIN):
             if entry.data.get(CONF_DEVICE_ID) != device.device_id:
                 continue
-            if entry.data.get("address") == device.ip:
+
+            if entry.data.get("address") != device.ip:
+                _LOGGER.info(
+                    "Tuya Orchestrator: device %s changed IP %s -> %s, updating and reloading",
+                    device.device_id,
+                    entry.data.get("address"),
+                    device.ip,
+                )
+                new_data = dict(entry.data)
+                new_data["address"] = device.ip
+                # This alone reconnects: HA fires the entry's update
+                # listener, which reloads the entry (tearing the old
+                # connection down), so do NOT also try to connect here -
+                # same reasoning as localtuya's own comment on this branch
+                # ("Updating settings triggers a reload of the config
+                # entry, which tears down the device so no need to
+                # connect in that case").
+                hass.config_entries.async_update_entry(entry, data=new_data)
                 break
-            _LOGGER.info(
-                "Tuya Orchestrator: device %s changed IP %s -> %s, updating and reloading",
-                device.device_id,
-                entry.data.get("address"),
-                device.ip,
-            )
-            new_data = dict(entry.data)
-            new_data["address"] = device.ip
-            hass.config_entries.async_update_entry(entry, data=new_data)
+
+            # Same IP, but we just HEARD from it - localtuya's
+            # `_device_discovered` ends by calling `device.async_connect()`
+            # for any device it isn't currently connected to, on every
+            # broadcast. That matters: a device that reboots keeps its DHCP
+            # lease (so the branch above never fires) but has dropped our
+            # TCP connection - a broadcast is proof it's back NOW, so
+            # reconnecting immediately beats waiting up to a full
+            # RECONNECT_INTERVAL for the periodic retry to notice.
+            stored = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+            local_device = stored.get("device") if isinstance(stored, dict) else None
+            if local_device is not None and not local_device.connected:
+                _LOGGER.debug(
+                    "Tuya Orchestrator: heard from disconnected device %s, reconnecting now",
+                    device.device_id,
+                )
+                hass.async_create_task(_async_try_connect(local_device))
             break
 
     listener = PersistentDiscovery(on_device=_on_device_seen)
@@ -103,10 +138,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             if device.connected:
                 continue
             _LOGGER.debug("Tuya Orchestrator: retrying connection to %s", device.device_id)
-            try:
-                await device.connect()
-            except Exception as err:  # noqa: BLE001 - just retry again next interval
-                _LOGGER.debug("Tuya Orchestrator: reconnect to %s failed: %s", device.device_id, err)
+            await _async_try_connect(device)
 
     hass.data[DOMAIN]["_reconnect_unsub"] = async_track_time_interval(
         hass, _async_reconnect, timedelta(seconds=RECONNECT_INTERVAL)

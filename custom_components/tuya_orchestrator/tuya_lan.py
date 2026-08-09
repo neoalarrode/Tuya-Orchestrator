@@ -157,6 +157,27 @@ class TuyaLocalDevice:
         # matching yet (see _negotiate_session_key's docstring).
         self._pending_cmd: dict[int, asyncio.Future] = {}
         self._lock = asyncio.Lock()
+        # Connection-lifecycle guards, ported from localtuya's
+        # `TuyaDevice.async_connect()` (common.py), which refuses to start a
+        # second connection with:
+        #     if not self._is_closing and self._connect_task is None
+        #        and not self._interface:
+        # This integration now has THREE independent things that can ask for
+        # a connection - initial entry setup, the RECONNECT_INTERVAL timer,
+        # and the discovery-broadcast callback (all in __init__.py) - so
+        # without a guard two of them can race, each opening its own socket
+        # and its own listen task while only the last-assigned writer stays
+        # reachable. The orphaned socket keeps consuming frames that then
+        # never reach the coordinator, which looks exactly like a random
+        # unexplained disconnection. The lock serializes callers and the
+        # `connected` re-check makes the losers no-ops.
+        self._connect_lock = asyncio.Lock()
+        self._is_closing = False
+        # Notified when an established connection drops on its own (failed
+        # heartbeat), so the coordinator can mark entities unavailable
+        # instead of leaving stale values on screen - localtuya does the
+        # equivalent via its `disconnected()` callback dispatching None.
+        self._on_disconnect: "Callable[[], None] | None" = None
         # 3.4 session-key negotiation state. The fixed nonce matches the
         # reference implementation exactly - security here rests on the
         # local_key's secrecy plus the HMAC exchange, not nonce randomness.
@@ -165,6 +186,16 @@ class TuyaLocalDevice:
 
     # -- connection lifecycle -------------------------------------------------
     async def connect(self, timeout: float = 5.0, retries: int = 3) -> None:
+        """Establish the LAN connection. Safe to call concurrently from any
+        of the reconnect triggers - see `_connect_lock`'s comment. A caller
+        that arrives while another is already connecting simply waits and
+        then returns, having found the connection already up."""
+        async with self._connect_lock:
+            if self._is_closing or self.connected:
+                return
+            await self._connect_locked(timeout, retries)
+
+    async def _connect_locked(self, timeout: float, retries: int) -> None:
         # Real report: a fresh connect() to a just-discovered device failed
         # outright with ConnectionResetError. Cheap embedded Tuya devices
         # commonly have a very limited TCP stack and can reject a new
@@ -201,19 +232,42 @@ class TuyaLocalDevice:
         if self.protocol_version == "3.4":
             ok = await self._negotiate_session_key()
             if not ok:
-                await self.close()
+                # BUG FIXED HERE: this called self.close(), which is now
+                # TERMINAL (it sets _is_closing, permanently refusing
+                # further connects - correct for entry unload, wrong here).
+                # A failed 3.4 handshake is a transient condition that must
+                # stay retryable by the reconnect paths, so tear the socket
+                # down without latching the device closed.
+                self._teardown()
                 raise TuyaProtocolError(f"{self.device_id}: 3.4 session key negotiation failed")
 
         self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
 
-    async def close(self) -> None:
+    def _teardown(self) -> None:
+        """Drop the current socket/tasks but leave the device reconnectable."""
         if self._listen_task:
             self._listen_task.cancel()
+            self._listen_task = None
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         if self._writer:
             self._writer.close()
+            # BUG FIXED HERE: _writer was left pointing at the dead writer.
+            # `connected` happened to still read False (a closed writer
+            # reports is_closing()), but every other path had to keep
+            # remembering that a non-None _writer may be garbage. Clearing
+            # it makes "no writer" and "not connected" the same fact.
+            self._writer = None
+        self._reader = None
         self.local_key = self.real_local_key  # reset any negotiated 3.4 session key
+
+    async def close(self) -> None:
+        """Terminal close - the device will not reconnect after this.
+        Called on config-entry unload; use _teardown() for a transient
+        connection drop that should still be retried."""
+        self._is_closing = True
+        self._teardown()
 
     @property
     def connected(self) -> bool:
@@ -244,8 +298,26 @@ class TuyaLocalDevice:
                     break
         except asyncio.CancelledError:
             return
-        if self._writer:
-            self._writer.close()
+        # GAP FIXED HERE (vs localtuya's `disconnected()` callback): the old
+        # code just closed the writer and said nothing. Entities kept
+        # displaying their last known values as if live, indefinitely, until
+        # some later poll happened to fail - so a dropped connection was
+        # invisible in the UI. localtuya dispatches None to its entities at
+        # exactly this point, marking them unavailable, and logs
+        # "Disconnected - waiting for discovery broadcast" (which is also
+        # literally what happens next here now: __init__.py reconnects on
+        # the device's next broadcast, or on the RECONNECT_INTERVAL tick).
+        _LOGGER.warning(
+            "%s: connection lost - waiting for discovery broadcast or periodic retry",
+            self.device_id,
+        )
+        # Detach ourselves first: _teardown() cancels _heartbeat_task, and
+        # this code IS that task - cancelling the currently-running task
+        # would throw CancelledError into our own remaining awaits.
+        self._heartbeat_task = None
+        self._teardown()
+        if self._on_disconnect is not None:
+            self._on_disconnect()
 
     # -- public API -------------------------------------------------------------
     async def status(self) -> dict[int, Any]:

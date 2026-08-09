@@ -41,6 +41,16 @@ class TuyaOrchestratorCoordinator(DataUpdateCoordinator[dict[int, Any]]):
         self.device = device
         self.profile = profile
         device._on_update = self._handle_push  # noqa: SLF001 - internal wiring
+        # Mirrors localtuya's `disconnected()` -> dispatch None -> entities
+        # go unavailable. Without this, a connection that dropped between
+        # two polls left every entity showing its last known value as
+        # though it were live.
+        device._on_disconnect = self._handle_disconnect  # noqa: SLF001
+
+    def _handle_disconnect(self) -> None:
+        self.async_set_update_error(
+            UpdateFailed(f"Lost LAN connection to {self.device.device_id}")
+        )
 
     def _handle_push(self, dps: dict[int, Any]) -> None:
         merged = dict(self.data or {})
