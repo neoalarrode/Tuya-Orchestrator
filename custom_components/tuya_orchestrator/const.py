@@ -28,6 +28,12 @@ CONF_ACCOUNT_ENTRY_ID = "account_entry_id"  # stashed on discovery_info to trace
 # __init__.py/discovery.py. Not an entry_id (those are HA-generated UUIDs),
 # so no collision with the per-entry storage that also lives under DOMAIN.
 DISCOVERY_DATA_KEY = "_persistent_discovery"
+# hass.data[DOMAIN][FAILED_TRACES_KEY][entry_id] - frame trace + state
+# snapshot kept when a device entry fails to set up. Without this the
+# device object (and its trace) is dropped on failure, leaving
+# diagnostics.py with nothing to show for precisely the entries that
+# need diagnosing. Not an entry_id, so no collision with per-entry data.
+FAILED_TRACES_KEY = "_failed_traces"
 
 # Cloud linking (used only during config_flow to fetch local_keys; never
 # stored/used again after setup - the running integration is 100% LAN).

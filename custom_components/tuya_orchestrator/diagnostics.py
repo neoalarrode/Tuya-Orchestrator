@@ -32,6 +32,7 @@ from .const import (
     CONF_LOCAL_KEY,
     CONF_UID,
     DISCOVERY_DATA_KEY,
+    FAILED_TRACES_KEY,
     DOMAIN,
     ENTRY_TYPE_ACCOUNT,
 )
@@ -71,10 +72,14 @@ async def async_get_config_entry_diagnostics(
 
     stored = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if not isinstance(stored, dict):
-        # The entry is not loaded (setup_retry / setup_error). The entry
-        # block plus discovery state above is still the useful part, and
-        # saying so beats an empty section that reads like a bug.
+        # The entry is not loaded (setup_retry / setup_error) - which is
+        # precisely the case worth diagnosing, so report the snapshot taken
+        # when setup failed rather than a bare "not loaded" (which is all
+        # this returned at first, and it was useless on a live instance).
         data["device"] = {"loaded": False}
+        failed = hass.data.get(DOMAIN, {}).get(FAILED_TRACES_KEY, {}).get(entry.entry_id)
+        if failed is not None:
+            data["last_setup_failure"] = failed
         return data
 
     device = stored["device"]

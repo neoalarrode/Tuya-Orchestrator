@@ -37,6 +37,7 @@ from .const import (
     CONF_UID,
     DEFAULT_SCAN_INTERVAL,
     DISCOVERY_DATA_KEY,
+    FAILED_TRACES_KEY,
     DOMAIN,
     ENTRY_TYPE_ACCOUNT,
     PLATFORMS,
@@ -59,6 +60,29 @@ async def _async_try_connect(device: TuyaLocalDevice) -> None:
         await device.connect()
     except Exception as err:  # noqa: BLE001
         _LOGGER.debug("Tuya Orchestrator: reconnect to %s failed: %s", device.device_id, err)
+
+
+def _snapshot_failure(device: TuyaLocalDevice, err: Exception) -> dict:
+    """State + frame trace to keep when a device entry fails to set up.
+
+    GAP FIXED HERE: on a failed setup the device object was simply dropped,
+    taking its frame trace with it - so diagnostics.py had nothing to report
+    for exactly the entries worth diagnosing (a failing entry showed only
+    `{"loaded": false}`, confirmed on a live instance). Keeping this lets the
+    next diagnostics download show what actually went over the wire before
+    it gave up.
+    """
+    return {
+        "error": f"{type(err).__name__}: {err}",
+        "address": device.address,
+        "protocol_version": device.protocol_version,
+        "dev_type": device.dev_type,
+        "session_key_negotiated": device.local_key != device.real_local_key,
+        "sequence_counter": device._seq,  # noqa: SLF001
+        "pending_by_sequence": sorted(device._pending),  # noqa: SLF001
+        "pending_by_command": [f"0x{c:02x}" for c in device._pending_cmd],  # noqa: SLF001
+        "frame_trace": device.trace(),
+    }
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -237,6 +261,9 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     try:
         await device.connect()
     except Exception as err:  # noqa: BLE001
+        hass.data.setdefault(DOMAIN, {}).setdefault(FAILED_TRACES_KEY, {})[
+            entry.entry_id
+        ] = _snapshot_failure(device, err)
         # GAP FIXED HERE (vs the reference's `update_local_key()`): Tuya
         # rotates a device's local_key whenever it is re-paired from the
         # phone app - a completely routine thing for a user to do. With a
@@ -256,7 +283,10 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     coordinator = TuyaOrchestratorCoordinator(hass, device, profile, scan_interval)
     try:
         await coordinator.async_config_entry_first_refresh()
-    except Exception:
+    except Exception as err:
+        hass.data.setdefault(DOMAIN, {}).setdefault(FAILED_TRACES_KEY, {})[
+            entry.entry_id
+        ] = _snapshot_failure(device, err)
         await device.close()
         raise
 

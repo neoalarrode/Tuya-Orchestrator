@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.11.1 - keep the frame trace when setup FAILS
+
+v0.11.0's diagnostics had the wrong hole in it, found the moment it was
+pointed at the live instance: an entry that fails to set up has no device
+object in `hass.data`, so its diagnostics reported exactly
+`{"loaded": false}` and nothing else - useless for precisely the entries
+worth diagnosing, which are the failing ones.
+
+The state snapshot and frame trace are now captured at the point of
+failure (both the connect and the first-refresh path) and surfaced under
+`last_setup_failure`: the error, address, protocol version, `dev_type`,
+whether a 3.4 session key was negotiated, the sequence counter, the
+outstanding waiters, and the frames that crossed the wire before it gave
+up.
+
 ## v0.11.0 - diagnostics platform with a per-device frame trace
 
 Home Assistant now offers a **Download diagnostics** button on every Tuya
