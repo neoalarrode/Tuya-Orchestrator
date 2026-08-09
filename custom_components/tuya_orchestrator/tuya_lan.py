@@ -52,6 +52,7 @@ import json
 import logging
 import struct
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -124,6 +125,11 @@ _VERSION_HEADER_TAIL = b"\x00" * 12  # follows the "3.3"/"3.4" version bytes
 # which depends on that connection staying open to receive unsolicited
 # push updates) alive. Matches the reference's own HEARTBEAT_INTERVAL.
 SEND_TIMEOUT = 10  # seconds to wait for a device reply before giving up
+# How many recent frames each device keeps for the diagnostics platform
+# (see diagnostics.py). Small and bounded - this is a rolling window meant
+# to answer "what actually went over the wire just before it broke?",
+# which is the one question a remote log at WARNING level cannot answer.
+TRACE_SIZE = 60
 HEARTBEAT_INTERVAL = 10
 
 
@@ -219,6 +225,7 @@ class TuyaLocalDevice:
         # from the device's profile (the reference fills it from the
         # configured entity list, same idea).
         self.dps_to_request: dict[str, Any] = {}
+        self._trace: deque = deque(maxlen=TRACE_SIZE)
         # 3.4 session-key negotiation state. The fixed nonce matches the
         # reference implementation exactly - security here rests on the
         # local_key's secrecy plus the HMAC exchange, not nonce randomness.
@@ -389,6 +396,27 @@ class TuyaLocalDevice:
         self._teardown()
         if self._on_disconnect is not None:
             self._on_disconnect()
+
+    def _trace_add(self, direction: str, seq: int, command: int, raw: bytes, note: str = "") -> None:
+        """Record one frame for diagnostics.py. Only the first 48 bytes of
+        the wire frame are kept: enough to see the header, retcode and the
+        start of the payload, while making it impossible for a whole
+        encrypted DP payload to end up in a diagnostics download."""
+        self._trace.append(
+            {
+                "t": round(time.time(), 3),
+                "dir": direction,
+                "seq": seq,
+                "cmd": f"0x{command:02x}",
+                "bytes": len(raw),
+                "head": binascii.hexlify(raw[:48]).decode(),
+                "note": note,
+            }
+        )
+
+    def trace(self) -> list[dict[str, Any]]:
+        """Snapshot of the recent frame history, oldest first."""
+        return list(self._trace)
 
     # -- public API -------------------------------------------------------------
     def add_dps_to_request(self, dp_ids) -> None:
@@ -613,6 +641,7 @@ class TuyaLocalDevice:
 
     async def _send_only(self, command: int, raw_payload: bytes) -> None:
         packet, _seq, _hmac_key = self._encode_message(command, raw_payload)
+        self._trace_add("tx", _seq, command, packet, "no reply expected")
         async with self._lock:
             self._writer.write(packet)
             await self._writer.drain()
@@ -626,6 +655,10 @@ class TuyaLocalDevice:
         if not self.connected:
             await self.connect()
         packet, seq, _hmac_key = self._encode_message(command, raw_payload)
+        self._trace_add(
+            "tx", seq, command, packet,
+            f"awaiting {'cmd 0x%02x' % wait_cmd if wait_cmd is not None else 'seq %d' % seq}",
+        )
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         if wait_cmd is not None:
@@ -682,6 +715,7 @@ class TuyaLocalDevice:
                             buf, hmac_framed=self.protocol_version == "3.4"
                         )
                     except TuyaProtocolError as err:
+                        self._trace_add("rx", -1, 0, buf[:48], f"UNPARSEABLE: {err}")
                         nxt = buf.find(PREFIX_BYTES, 1)
                         _LOGGER.debug(
                             "%s: %s - %s",
@@ -696,6 +730,20 @@ class TuyaLocalDevice:
                     buf = buf[consumed:]
                     obj = self._decode_frame_payload(frame.payload)
                     parsed = TuyaMessage(frame.seq, frame.command, obj)
+                    # Which waiter (if any) this frame lands on is the whole
+                    # question when a command times out, so record it.
+                    if self._pending_cmd.get(frame.command) is not None:
+                        route = "-> cmd waiter"
+                    elif self._pending.get(frame.seq) is not None:
+                        route = "-> seq waiter"
+                    elif obj:
+                        route = "-> unsolicited push"
+                    else:
+                        route = "-> DROPPED (no waiter, undecodable)"
+                    self._trace_add(
+                        "rx", frame.seq, frame.command, frame.payload,
+                        f"{route}; decoded={'yes' if obj else 'no'}",
+                    )
 
                     # Command-sentinel waiters (3.4 handshake) take
                     # priority - matches the reference's own dispatch order

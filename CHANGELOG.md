@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.11.0 - diagnostics platform with a per-device frame trace
+
+Home Assistant now offers a **Download diagnostics** button on every Tuya
+Orchestrator config entry.
+
+This exists to close a concrete gap. A device can complete its handshake
+and then have every query time out, and the only thing that answers *why*
+is the sequence of frames that actually crossed the wire. That detail is
+logged at DEBUG - and DEBUG is unreachable from outside the instance:
+recent Home Assistant no longer exposes `/api/error_log`, and the API
+that remains (`system_log`) carries only WARNING and above. Diagnosing
+the three protocol-3.4 devices currently stuck in `setup_retry` on a live
+instance ran straight into this.
+
+Each device entry's diagnostics include:
+
+- connection state: address, protocol version, `dev_type`, whether a 3.4
+  session key was negotiated, the current sequence counter, and which
+  waiters are outstanding (by sequence number and by command) - the exact
+  state needed to tell "no reply arrived" apart from "a reply arrived and
+  landed on the wrong waiter";
+- the coordinator's last update result, last exception and current DP
+  values;
+- the profile's DP map;
+- a rolling trace of the last 60 frames, each recording direction,
+  sequence number, command, size, and **which waiter it was routed to** -
+  including frames that were dropped for having no waiter, and any that
+  failed to parse.
+
+Account entries and unloaded entries get the useful subset, plus the
+domain-wide LAN discovery state (which devices have been heard
+broadcasting, at which IP and protocol version) - usually the first
+question for a device that will not connect.
+
+**Redaction**: local keys, cloud credentials and the account UID never
+appear. Frame traces keep only the first 48 bytes of each frame - enough
+for the header, retcode and the start of the payload, not enough to carry
+a whole encrypted DP payload out of the instance.
+
 ## v0.10.1 - fix the sequence-counter rewind introduced in v0.9.0
 
 Diagnosed against the live Home Assistant instance (2026.8.1) rather than
