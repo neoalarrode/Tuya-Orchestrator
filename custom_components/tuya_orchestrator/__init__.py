@@ -16,6 +16,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.typing import ConfigType
 
 from .account import async_setup_account
@@ -78,11 +79,26 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
         local_key=data[CONF_LOCAL_KEY],
         protocol_version=data.get(CONF_PROTOCOL_VERSION, "3.3"),
     )
-    await device.connect()
+    # BUG FIXED HERE: a connection failure (device briefly offline, reset,
+    # 3.4 handshake failure...) used to propagate as a raw exception - HA
+    # logs that as a scary "Error setting up entry" traceback and does NOT
+    # treat it as a normal retry-able state (that traceback is exactly
+    # what a live report pasted for a ConnectionResetError). Tuya devices
+    # going briefly unreachable is routine, not exceptional - the correct
+    # HA pattern is ConfigEntryNotReady, which shows a clean "not ready,
+    # will retry" status and actually retries on HA's own schedule.
+    try:
+        await device.connect()
+    except Exception as err:  # noqa: BLE001
+        raise ConfigEntryNotReady(f"Could not connect to {data[CONF_DEVICE_ID]} at {entry.data['address']}: {err}") from err
 
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     coordinator = TuyaOrchestratorCoordinator(hass, device, profile, scan_interval)
-    await coordinator.async_config_entry_first_refresh()
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        await device.close()
+        raise
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "coordinator": coordinator,

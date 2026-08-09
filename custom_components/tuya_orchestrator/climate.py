@@ -125,7 +125,16 @@ class TuyaClimate(CoordinatorEntity[TuyaOrchestratorCoordinator], ClimateEntity)
             label = m.mode_map.get(raw)
             if label in _HVAC_MODE_VALUES:
                 return HVACMode(label)
-        return HVACMode.HEAT
+        # BUG FIXED HERE: this used to fall back to a hardcoded
+        # HVACMode.HEAT regardless of whether HEAT is actually one of
+        # THIS device's declared hvac_modes (e.g. a cool-only unit, or a
+        # transient/unrecognized raw mode value) - returning a mode the
+        # entity itself never declared as valid. Fall back to whatever
+        # non-OFF mode this device actually supports instead.
+        for candidate in self._attr_hvac_modes:
+            if candidate != HVACMode.OFF:
+                return candidate
+        return HVACMode.OFF
 
     @property
     def current_temperature(self) -> float | None:

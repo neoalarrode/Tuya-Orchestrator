@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.6.0 - full-project audit: 6 more real bugs, including the actual reason the LAN error persisted
+
+Requested explicitly ("revisa todo el puñetero proyecto, conjunto") - a
+systematic read-through of every module, not just the LAN protocol files
+already diffed against localtuya repeatedly. Found and fixed:
+
+1. **The actual reason "no encontrado en LAN" kept happening after
+   v0.5.1's active-scan fix**: `discovery_info` (an HA discovery flow's
+   data) is a SNAPSHOT captured when the "Discovered" card was first
+   created - HA never refreshes it. Clicking Configure days later replays
+   whatever IP was baked in at creation time, stale (DHCP change) or, for
+   any card created before the v0.5.1 false-positive fix, outright WRONG
+   from the start. The code only re-checked the IP when it was completely
+   missing, silently trusting a present-but-possibly-bad one otherwise.
+   Now always prefers the live, continuously-updated `PersistentDiscovery`
+   cache over the stale snapshot, falling back to the snapshot only if the
+   device isn't in the live cache. **Old "Discovered" cards from before
+   this fix still carry bad data - dismiss/ignore them and let them
+   regenerate, don't click Configure on a stale one.**
+2. **Entity unique_id collision**: two `dps:` entries sharing the same
+   `dp_id` with different `bit:` values (this AC's display-light/buzzer
+   switches, both on dp 123) produced IDENTICAL unique_ids - HA silently
+   drops one of the two colliding entities. Fixed to include the bit
+   index in the unique_id.
+3. **climate.py's hvac_mode fallback returned a hardcoded HVACMode.HEAT**
+   even when HEAT isn't one of the specific device's declared
+   `hvac_modes` (e.g. a cool-only unit, or an unrecognized raw mode
+   value) - returning a mode the entity itself never declared as valid.
+   Now falls back to whatever non-OFF mode the device actually supports.
+4. **Composite mapping `*_dp` fields weren't type-coerced** the way plain
+   `dps:` entries already were - a hand-edited profile with an
+   accidentally-quoted dp id (`brightness_dp: "22"` instead of `22`)
+   silently never matched `coordinator.data`'s int keys, with no error
+   anywhere, just a permanently-unknown entity. Every composite field is
+   now coerced through the same `int()` path `dps:` always used.
+5. **`tuya_cloud.py`'s `get_device_schema()` only caught
+   `TuyaCloudApiError`**, not the separate `TuyaCloudAuthError` class -
+   a transient token race on the v1.1 call escaped past the method's own
+   "try both endpoints, only fail if both fail" design, preventing v2.0
+   from ever being tried even though a fresh token there could well have
+   worked.
+6. **`_async_setup_device_entry` let a connection failure propagate as a
+   raw exception** instead of `ConfigEntryNotReady` - HA logs that as a
+   scary "Error setting up entry" traceback (exactly what an earlier live
+   report pasted for a `ConnectionResetError`) and doesn't treat it as
+   the normal retry-able state Tuya devices being briefly unreachable
+   actually is. Also closes the device's connection if the first
+   coordinator refresh fails, instead of leaking the socket.
+
 ## v0.5.1 - fix: false-positive device matching in active scan, deprecated battery_level
 
 **Critical fix**: `active_scan.py`'s device identification only checked

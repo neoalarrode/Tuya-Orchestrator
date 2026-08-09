@@ -136,21 +136,35 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
 
         self._chosen_device = discovery_info
-        self._chosen_ip = discovery_info.get("ip")
         self.context["title_placeholders"] = {"name": discovery_info.get("name", device_id)}
 
-        version = discovery_info.get("version")
-        if self._chosen_ip is None:
-            # Not seen in the account poller's last LAN pass - check the
-            # always-on PersistentDiscovery cache first (instant, no extra
-            # listening needed), then fall back to a short fresh listen
-            # before giving up and asking the user for a static IP.
-            persistent = self.hass.data.get(DOMAIN, {}).get(DISCOVERY_DATA_KEY)
-            found = persistent.devices.get(device_id) if persistent else None
-            if found is None:
+        # BUG FIXED HERE: `discovery_info` is a SNAPSHOT captured the
+        # moment this discovery flow/card was first created - HA does NOT
+        # refresh it later. If the user doesn't click "Configure" right
+        # away (common - cards sit until acted on), the IP baked into that
+        # snapshot can go stale (DHCP lease change) - or, for a card
+        # created before the active_scan.py false-positive fix, could have
+        # been WRONG from the start. This used to only re-check when `ip`
+        # was missing entirely, silently trusting a present-but-possibly-
+        # stale/wrong one otherwise. Now always prefers the live,
+        # continuously-updated PersistentDiscovery cache over the
+        # snapshot, and only falls back to the snapshot's ip if the device
+        # isn't currently in that live cache.
+        persistent = self.hass.data.get(DOMAIN, {}).get(DISCOVERY_DATA_KEY)
+        found = persistent.devices.get(device_id) if persistent else None
+        if found is not None:
+            self._chosen_ip = found.ip
+            version = found.version
+        else:
+            self._chosen_ip = discovery_info.get("ip")
+            version = discovery_info.get("version")
+            if self._chosen_ip is None:
+                # Not seen in the live cache OR the original snapshot -
+                # one last short fresh listen before giving up and asking
+                # the user for a static IP.
                 found = (await discover_devices()).get(device_id)
-            self._chosen_ip = found.ip if found else None
-            version = found.version if found else version
+                self._chosen_ip = found.ip if found else None
+                version = found.version if found else version
         # 3.4 is now a real, ported implementation (session-key handshake -
         # see tuya_lan.py) - this guard used to reject it outright; only
         # 3.5 (a different device family, still genuinely unimplemented)

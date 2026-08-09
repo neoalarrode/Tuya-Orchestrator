@@ -280,6 +280,20 @@ class DeviceProfile:
         return [d for d in self.dps if d.platform == platform]
 
 
+def _int_or_none(value: Any) -> int | None:
+    """Coerce an optional dp_id-like field to int. BUG FIXED HERE: composite
+    mapping fields (LightMapping/ClimateMapping/VacuumMapping's `*_dp`
+    fields) were stored exactly as YAML parsed them, unlike the plain
+    `dps:` list's `id` (already `int()`-cast). A hand-edited profile with
+    an accidentally-quoted dp id (`brightness_dp: "22"` instead of `22`)
+    silently never matches coordinator.data's int keys - the entity just
+    always reads None, no error anywhere. Every composite `*_dp`/`*_scale`
+    field below is now coerced the same way `dps:` already was."""
+    if value is None:
+        return None
+    return int(value)
+
+
 def parse_profile(yaml_text: str) -> DeviceProfile:
     raw = yaml.safe_load(yaml_text)
     if not isinstance(raw, dict) or not any(k in raw for k in ("dps", "lights", "climates", "vacuums")):
@@ -301,7 +315,7 @@ def parse_profile(yaml_text: str) -> DeviceProfile:
                 max_value=entry.get("max"),
                 step=entry.get("step"),
                 icon=entry.get("icon"),
-                bit=entry.get("bit"),
+                bit=_int_or_none(entry.get("bit")),
             )
         )
     lights = []
@@ -310,17 +324,17 @@ def parse_profile(yaml_text: str) -> DeviceProfile:
             LightMapping(
                 name=entry.get("name", "Light"),
                 switch_dp=int(entry["switch_dp"]),
-                brightness_dp=entry.get("brightness_dp"),
+                brightness_dp=_int_or_none(entry.get("brightness_dp")),
                 brightness_min=entry.get("brightness_min", 0),
                 brightness_max=entry.get("brightness_max", 255),
-                color_temp_dp=entry.get("color_temp_dp"),
+                color_temp_dp=_int_or_none(entry.get("color_temp_dp")),
                 color_temp_min=entry.get("color_temp_min", 0),
                 color_temp_max=entry.get("color_temp_max", 255),
-                color_dp=entry.get("color_dp"),
+                color_dp=_int_or_none(entry.get("color_dp")),
                 color_h_max=entry.get("color_h_max", 360),
                 color_s_max=entry.get("color_s_max", 1000),
                 color_v_max=entry.get("color_v_max", 1000),
-                work_mode_dp=entry.get("work_mode_dp"),
+                work_mode_dp=_int_or_none(entry.get("work_mode_dp")),
                 work_mode_white=entry.get("work_mode_white", "white"),
                 work_mode_colour=entry.get("work_mode_colour", "colour"),
                 icon=entry.get("icon"),
@@ -332,22 +346,22 @@ def parse_profile(yaml_text: str) -> DeviceProfile:
         climates.append(
             ClimateMapping(
                 name=entry.get("name", "Climate"),
-                switch_dp=entry.get("switch_dp"),
-                current_temp_dp=entry.get("current_temp_dp"),
+                switch_dp=_int_or_none(entry.get("switch_dp")),
+                current_temp_dp=_int_or_none(entry.get("current_temp_dp")),
                 current_temp_scale=entry.get("current_temp_scale"),
-                target_temp_dp=entry.get("target_temp_dp"),
+                target_temp_dp=_int_or_none(entry.get("target_temp_dp")),
                 target_temp_scale=entry.get("target_temp_scale"),
                 target_temp_min=entry.get("target_temp_min", 5),
                 target_temp_max=entry.get("target_temp_max", 35),
                 target_temp_step=entry.get("target_temp_step", 0.5),
-                mode_dp=entry.get("mode_dp"),
+                mode_dp=_int_or_none(entry.get("mode_dp")),
                 mode_map=entry.get("mode_map"),
-                fan_dp=entry.get("fan_dp"),
+                fan_dp=_int_or_none(entry.get("fan_dp")),
                 fan_map=entry.get("fan_map"),
-                preset_dp=entry.get("preset_dp"),
+                preset_dp=_int_or_none(entry.get("preset_dp")),
                 preset_map=entry.get("preset_map"),
-                humidity_dp=entry.get("humidity_dp"),
-                swing_dp=entry.get("swing_dp"),
+                humidity_dp=_int_or_none(entry.get("humidity_dp")),
+                swing_dp=_int_or_none(entry.get("swing_dp")),
                 swing_map=entry.get("swing_map"),
                 icon=entry.get("icon"),
             )
@@ -358,16 +372,16 @@ def parse_profile(yaml_text: str) -> DeviceProfile:
         vacuums.append(
             VacuumMapping(
                 name=entry.get("name", "Vacuum"),
-                start_dp=entry.get("start_dp"),
+                start_dp=_int_or_none(entry.get("start_dp")),
                 start_map=entry.get("start_map"),
-                pause_dp=entry.get("pause_dp"),
-                return_dp=entry.get("return_dp"),
-                locate_dp=entry.get("locate_dp"),
-                battery_dp=entry.get("battery_dp"),
+                pause_dp=_int_or_none(entry.get("pause_dp")),
+                return_dp=_int_or_none(entry.get("return_dp")),
+                locate_dp=_int_or_none(entry.get("locate_dp")),
+                battery_dp=_int_or_none(entry.get("battery_dp")),
                 battery_scale=entry.get("battery_scale"),
-                status_dp=entry.get("status_dp"),
+                status_dp=_int_or_none(entry.get("status_dp")),
                 status_map=entry.get("status_map"),
-                fan_speed_dp=entry.get("fan_speed_dp"),
+                fan_speed_dp=_int_or_none(entry.get("fan_speed_dp")),
                 fan_speed_map=entry.get("fan_speed_map"),
                 icon=entry.get("icon"),
             )

@@ -135,18 +135,25 @@ class TuyaCloudApi:
         entries_by_dp: dict[int, dict[str, Any]] = {}
         errors: list[Exception] = []
 
+        # BUG FIXED HERE: this used to catch only TuyaCloudApiError - but
+        # _request() can also raise TuyaCloudAuthError (a separate class,
+        # not a subclass), e.g. on a transient token race. That escaped
+        # uncaught past this method's whole "try both endpoints, only fail
+        # if both fail" resilience design, meaning a bad v1.1 token call
+        # prevented v2.0 from ever being tried at all, even though a fresh
+        # token fetch on the v2.0 attempt could well have succeeded.
         try:
             result = await self._request("GET", f"/v1.1/devices/{device_id}/specifications")
             for e in _normalize_v11_schema(result):
                 entries_by_dp[e["dp_id"]] = e
-        except TuyaCloudApiError as err:
+        except (TuyaCloudApiError, TuyaCloudAuthError) as err:
             errors.append(err)
 
         try:
             result = await self._request("GET", f"/v2.0/cloud/thing/{device_id}/model")
             for e in _normalize_v20_schema(result):
                 entries_by_dp.setdefault(e["dp_id"], e)
-        except TuyaCloudApiError as err:
+        except (TuyaCloudApiError, TuyaCloudAuthError) as err:
             errors.append(err)
 
         if not entries_by_dp and errors:
