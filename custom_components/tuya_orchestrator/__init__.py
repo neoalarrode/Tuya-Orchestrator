@@ -42,6 +42,7 @@ from .const import (
     ENTRY_TYPE_ACCOUNT,
     PLATFORMS,
     RECONNECT_INTERVAL,
+    SUPPORTED_PROTOCOL_VERSIONS,
 )
 from .coordinator import TuyaOrchestratorCoordinator
 from .discovery import DiscoveredDevice, PersistentDiscovery
@@ -114,15 +115,36 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             if entry.data.get(CONF_DEVICE_ID) != device.device_id:
                 continue
 
+            new_data = dict(entry.data)
+            changes = []
+
             if entry.data.get("address") != device.ip:
-                _LOGGER.info(
-                    "Tuya Orchestrator: device %s changed IP %s -> %s, updating and reloading",
-                    device.device_id,
-                    entry.data.get("address"),
-                    device.ip,
-                )
-                new_data = dict(entry.data)
+                changes.append(f"IP {entry.data.get('address')} -> {device.ip}")
                 new_data["address"] = device.ip
+
+            # BUG FIXED HERE: only the IP was ever corrected from a
+            # broadcast, never the protocol version - and a WRONG stored
+            # version is fatal in a way a wrong IP is not. Confirmed on a
+            # live instance: three devices that broadcast `version: 3.4`
+            # were stored as 3.3 (the config-flow default, used whenever
+            # the discovery snapshot carried no version). At 3.3 the code
+            # sends a plain DP_QUERY and never negotiates a session key, so
+            # a 3.4 device simply never answers - the diagnostics frame
+            # trace showed exactly that: `tx 0x0a` with no reply, ever,
+            # forever, on all three. The broadcast carries the truth, so
+            # believe it, exactly as we already do for the address.
+            if device.version and device.version in SUPPORTED_PROTOCOL_VERSIONS:
+                stored_version = entry.data.get(CONF_PROTOCOL_VERSION)
+                if stored_version != device.version:
+                    changes.append(f"protocol {stored_version} -> {device.version}")
+                    new_data[CONF_PROTOCOL_VERSION] = device.version
+
+            if changes:
+                _LOGGER.info(
+                    "Tuya Orchestrator: device %s corrected from its broadcast (%s), reloading",
+                    device.device_id,
+                    "; ".join(changes),
+                )
                 # This alone reconnects: HA fires the entry's update
                 # listener, which reloads the entry (tearing the old
                 # connection down), so do NOT also try to connect here -

@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.12.0 - correct a wrong stored protocol version from the broadcast
+
+The diagnostics platform paid for itself immediately. On the live
+instance, three devices stuck in `setup_retry` all reported the same
+thing:
+
+```
+192.168.1.43  v3.3  session_key=False  seq=2
+  tx seq=1  0x0a  152B  awaiting seq 1     <- never answered
+  tx seq=2  0x09  104B  awaiting cmd 0x09
+```
+
+Those three devices **broadcast `version: 3.4`** - the integration's own
+discovery cache had them right - but their config entries stored `3.3`,
+the config-flow default used whenever the discovery snapshot carried no
+version. At 3.3 the code sends a plain `DP_QUERY` (0x0a) and never
+negotiates a session key, and a 3.4 device simply never answers that. So
+the entry failed forever, while the exact same code talking 3.4 to the
+exact same devices worked first time.
+
+A wrong stored IP was already corrected from the broadcast; a wrong
+stored protocol version was not - and it is fatal in a way a wrong IP is
+not. `_on_device_seen` now corrects both, on the same mechanism: update
+the entry, let Home Assistant's update listener reload it. Devices
+mis-stored this way repair themselves on the next broadcast, with no user
+action.
+
+Also: `SUPPORTED_PROTOCOL_VERSIONS` was still `["3.1", "3.3", "3.4"]`
+even though 3.2 support landed in v0.10.0 - so a 3.2 broadcast would have
+been rejected by this very check. Added.
+
 ## v0.11.1 - keep the frame trace when setup FAILS
 
 v0.11.0's diagnostics had the wrong hole in it, found the moment it was
