@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.1 - say WHY a connection dropped
+
+From a real report: the `connection lost - waiting for discovery
+broadcast or periodic retry` warning named the device but not the cause,
+because the cause (heartbeat timeout vs a specific exception) was only
+logged at debug level. A warning that tells you something broke without
+telling you what is not much use. The reason is now part of the message
+itself, and the reply timeout is a named constant (`SEND_TIMEOUT`) rather
+than a literal buried in the send path.
+
 ## v0.9.0 - the rest of the protocol layer: sequence-number sync and stream robustness
 
 v0.8.0's claim of a complete pass was overstated: three blocks of the

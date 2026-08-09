@@ -123,6 +123,7 @@ _VERSION_HEADER_TAIL = b"\x00" * 12  # follows the "3.3"/"3.4" version bytes
 # project's whole "reactive, not polling" design - see coordinator.py -
 # which depends on that connection staying open to receive unsolicited
 # push updates) alive. Matches the reference's own HEARTBEAT_INTERVAL.
+SEND_TIMEOUT = 10  # seconds to wait for a device reply before giving up
 HEARTBEAT_INTERVAL = 10
 
 
@@ -335,6 +336,7 @@ class TuyaLocalDevice:
         )
 
     async def _heartbeat_loop(self) -> None:
+        reason = "unknown"
         # GAP FIXED HERE (found reviewing the reference's
         # TuyaProtocol.start_heartbeat()): without a periodic HEART_BEAT, a
         # real device can silently drop the TCP connection after a short
@@ -351,10 +353,10 @@ class TuyaLocalDevice:
                     await self.heartbeat()
                     await asyncio.sleep(HEARTBEAT_INTERVAL)
                 except asyncio.TimeoutError:
-                    _LOGGER.debug("%s: heartbeat timed out, closing connection", self.device_id)
+                    reason = f"no heartbeat reply within {SEND_TIMEOUT}s"
                     break
                 except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("%s: heartbeat failed (%s), closing connection", self.device_id, err)
+                    reason = f"{type(err).__name__}: {err}"
                     break
         except asyncio.CancelledError:
             return
@@ -367,9 +369,13 @@ class TuyaLocalDevice:
         # "Disconnected - waiting for discovery broadcast" (which is also
         # literally what happens next here now: __init__.py reconnects on
         # the device's next broadcast, or on the RECONNECT_INTERVAL tick).
+        # The REASON used to be debug-only, so a real report of this warning
+        # said a connection dropped but gave nothing to act on. It belongs
+        # in the message itself.
         _LOGGER.warning(
-            "%s: connection lost - waiting for discovery broadcast or periodic retry",
+            "%s: connection lost (%s) - waiting for discovery broadcast or periodic retry",
             self.device_id,
+            reason,
         )
         # Detach ourselves first: _teardown() cancels _heartbeat_task, and
         # this code IS that task - cancelling the currently-running task
@@ -618,7 +624,7 @@ class TuyaLocalDevice:
             self._writer.write(packet)
             await self._writer.drain()
         try:
-            return await asyncio.wait_for(fut, timeout=10)
+            return await asyncio.wait_for(fut, timeout=SEND_TIMEOUT)
         finally:
             self._pending.pop(seq, None)
             if wait_cmd is not None:
