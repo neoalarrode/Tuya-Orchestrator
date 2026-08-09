@@ -77,6 +77,10 @@ FOOTER_SIZE_HMAC = 36  # hmac-sha256(32)+suffix(4) - protocol 3.4 only
 MAX_PAYLOAD_LEN = 1000
 
 CMD_CONTROL = 0x07
+# The device's SPONTANEOUS state report. Distinct from CMD_STATUS (0x0a),
+# which is what WE send to ask for state. Confirmed on real hardware: a
+# watering pump emits one of these roughly every second while running.
+CMD_STATUS_REPORT = 0x08
 CMD_HEARTBEAT = 0x09
 CMD_STATUS = 0x0A  # a.k.a. "DP_QUERY" in the reference - kept this name
 # for the rest of this codebase, which predates this port
@@ -753,10 +757,28 @@ class TuyaLocalDevice:
                         cmd_fut.set_result(TuyaMessage(frame.seq, frame.command, frame.payload))
                         continue
 
-                    fut = self._pending.get(frame.seq)
+                    # BUG FIXED HERE: a spontaneous report could satisfy a
+                    # waiter that was expecting the reply to OUR command.
+                    # Because the counter resync (v0.9.0) deliberately
+                    # mirrors the device's numbering, our sends land in the
+                    # same number space the device uses for its own reports,
+                    # so collisions are not rare - they are guaranteed on a
+                    # chatty device. Seen in a live frame trace: our
+                    # heartbeat went out as seq 40272 and the device's own
+                    # report arrived as seq 40272 in the same window. A
+                    # report matching a pending sequence number would then
+                    # be handed back as "the reply", and the real reply,
+                    # arriving with no waiter left, was dropped. Spontaneous
+                    # reports are always treated as pushes unless we
+                    # explicitly asked for that command.
+                    is_spontaneous = (
+                        frame.command == CMD_STATUS_REPORT
+                        and CMD_STATUS_REPORT not in self._pending_cmd
+                    )
+                    fut = None if is_spontaneous else self._pending.get(frame.seq)
                     if fut and not fut.done():
                         fut.set_result(parsed)
-                    elif obj and self._on_update:
+                    elif obj and self._on_update:  # push (incl. spontaneous reports)
                         # GAP FIXED HERE: the reference resynchronizes its
                         # sequence counter to the DEVICE's on every
                         # unsolicited status frame (`_status_update`:

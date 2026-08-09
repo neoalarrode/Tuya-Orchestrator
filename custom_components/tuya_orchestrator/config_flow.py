@@ -57,6 +57,11 @@ PROFILES_DIR = Path(__file__).parent / "profiles"
 
 
 def _builtin_profiles() -> dict[str, DeviceProfile]:
+    """BLOCKING - directory scan plus file reads. Must be called via an
+    executor, never straight from the event loop: Home Assistant flags that
+    ("Detected blocking call to scandir ... inside the event loop", seen on
+    a live instance) because it stalls everything else HA is doing.
+    Use `async_builtin_profiles()` below."""
     profiles = {}
     if PROFILES_DIR.exists():
         for f in PROFILES_DIR.glob("*.yaml"):
@@ -65,6 +70,11 @@ def _builtin_profiles() -> dict[str, DeviceProfile]:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Skipping invalid built-in profile %s: %s", f, err)
     return profiles
+
+
+async def async_builtin_profiles(hass) -> dict[str, DeviceProfile]:
+    """Load the built-in profiles off the event loop."""
+    return await hass.async_add_executor_job(_builtin_profiles)
 
 
 def _match_profile(profiles: dict[str, DeviceProfile], product_id: str | None) -> str | None:
@@ -268,7 +278,7 @@ class TuyaOrchestratorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     # -- review the auto-detected profile, or pick a built-in / paste one ---
     async def async_step_profile(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         errors: dict[str, str] = {}
-        profiles = _builtin_profiles()
+        profiles = await async_builtin_profiles(self.hass)
         builtin_match = _match_profile(profiles, self._chosen_device.get("product_id"))
 
         options = {}

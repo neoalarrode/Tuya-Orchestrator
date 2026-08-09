@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.12.1 - stop spontaneous reports impersonating command replies
+
+From a live report of a device dropping its connection twice, and the
+frame trace that explained it. The watering pump emits a spontaneous
+state report (command `0x08`) roughly **once per second**, and the trace
+caught this:
+
+```
+tx seq=40272 0x09   <- our heartbeat
+rx seq=40272 0x08   <- the device's own report, SAME sequence number
+rx seq=40273 0x09
+```
+
+The sequence-counter resync added in v0.9.0 deliberately mirrors the
+device's numbering, which means our sends land in the same number space
+the device uses for its own reports. On a chatty device, collisions are
+not rare - they are guaranteed. A colliding report would then be handed
+back as "the reply" to whatever command was waiting on that sequence
+number, and the real reply, arriving with no waiter left, was dropped.
+
+Command `0x08` was not even defined here (`CMD_STATUS = 0x0a` is what
+*we* send to ASK for state; `0x08` is what the device sends
+spontaneously). Now defined as `CMD_STATUS_REPORT`, and a spontaneous
+report is always routed as a push unless that exact command was
+explicitly requested.
+
+Also fixes the blocking call Home Assistant was flagging on this
+integration: `_builtin_profiles()` scans a directory and reads files, and
+was being called straight from the event loop during the config flow
+("Detected blocking call to scandir ... inside the event loop"). It now
+runs in an executor.
+
 ## v0.12.0 - correct a wrong stored protocol version from the broadcast
 
 The diagnostics platform paid for itself immediately. On the live
