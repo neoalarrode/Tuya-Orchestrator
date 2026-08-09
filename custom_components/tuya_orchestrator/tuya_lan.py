@@ -631,6 +631,20 @@ class TuyaLocalDevice:
         if wait_cmd is not None:
             self._pending_cmd[wait_cmd] = fut
         else:
+            # Belt and braces after the rewind bug above: never silently
+            # displace an in-flight waiter. The reference is loud about
+            # this too (`wait_for`: `if seqno in self.listeners: raise`),
+            # and silently overwriting is exactly what turned that bug
+            # into unexplained 10s timeouts instead of a visible error.
+            existing = self._pending.get(seq)
+            if existing is not None and not existing.done():
+                _LOGGER.warning(
+                    "%s: sequence number %d is already awaiting a reply - "
+                    "not displacing it (this indicates a counter desync)",
+                    self.device_id,
+                    seq,
+                )
+                existing.cancel()
             self._pending[seq] = fut
 
         async with self._lock:
@@ -708,7 +722,21 @@ class TuyaLocalDevice:
                         # pre-increments where the reference's
                         # post-increments, so `_seq = seqno` here gives the
                         # same next-send value as its `seqno + 1`.)
-                        if frame.seq > 0:
+                        # MUST only ever move FORWARD. BUG FIXED HERE, and
+                        # it was introduced by this very resync in v0.9.0:
+                        # a device numbers its own unsolicited pushes from
+                        # its own low counter, so assigning it outright
+                        # REWINDS ours. The next sends then reuse sequence
+                        # numbers already in flight, a second request
+                        # overwrites the first's entry in _pending, and the
+                        # orphaned first request waits out its full timeout.
+                        # Seen live: 569 "no heartbeat reply within 10s"
+                        # warnings on one device, each one tearing down a
+                        # perfectly healthy connection - the heartbeat was
+                        # fine in isolation and only failed because the
+                        # coordinator's concurrent status() poll kept
+                        # colliding with it after a rewind.
+                        if frame.seq > self._seq:
                             self._seq = frame.seq
                         dps = _extract_dps(parsed)
                         if dps:

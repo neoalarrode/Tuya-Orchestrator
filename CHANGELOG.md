@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.10.1 - fix the sequence-counter rewind introduced in v0.9.0
+
+Diagnosed against the live Home Assistant instance (2026.8.1) rather than
+from reports. Its log showed **569** occurrences of
+`connection lost (no heartbeat reply within 10s)` on a single device -
+a device that answers heartbeats perfectly when tested in isolation
+(verified directly on the LAN: it replies to HEART_BEAT with seqno 0 and
+an empty payload, exactly as expected).
+
+The cause was the sequence-counter resync added in v0.9.0. Following the
+device's numbering was right; assigning it outright was not. A device
+numbers its own unsolicited pushes from its own low counter, so the
+resync could REWIND ours. Subsequent sends then reused sequence numbers
+still in flight, a second request silently overwrote the first's entry in
+`_pending`, and the orphaned first request waited out its full 10s
+timeout. The heartbeat only failed in Home Assistant - and not in
+isolated testing - because there the coordinator's concurrent `status()`
+poll is what collided with it after a rewind.
+
+Two fixes:
+
+1. The resync now only ever moves the counter **forward**
+   (`if frame.seq > self._seq`), preserving the intent without ever
+   reusing a number.
+2. Registering a waiter no longer silently displaces an in-flight one.
+   The reference is loud about this too (`wait_for`: `if seqno in
+   self.listeners: raise`), and silently overwriting is exactly what
+   turned this into unexplained timeouts instead of a visible error.
+
+Also: the Spanish translation used Rioplatense forms ("asegurate",
+"ingresá", "revisá", "elegí", "pegá") in strings shown in the config
+flow. Corrected to Peninsular Spanish.
+
 ## v0.10.0 - locate legacy devices by MAC; protocol 3.2 support
 
 Continued testing directly against the live account and LAN.

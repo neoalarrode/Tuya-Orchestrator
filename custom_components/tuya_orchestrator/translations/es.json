@@ -23,7 +23,7 @@
       },
       "discovery_ip": {
         "title": "{name}: no visto actualmente en la LAN",
-        "description": "Este dispositivo se conoce vía tu cuenta de Tuya Cloud pero no apareció en un sondeo de broadcast recién - asegurate de que esté encendido y en la misma red/VLAN, o ingresá su IP manualmente.",
+        "description": "Este dispositivo se conoce vía tu cuenta de Tuya Cloud pero no apareció en un sondeo de broadcast recién - asegúrate de que esté encendido y en la misma red/VLAN, o introduce su IP manualmente.",
         "data": {
           "address": "Dirección IP"
         }
@@ -39,7 +39,7 @@
       },
       "profile": {
         "title": "Perfil del dispositivo",
-        "description": "Auto-detectado desde el schema real de DPs del dispositivo cuando está disponible (siempre revisá antes de guardar) - o elegí un perfil incluido / pegá tu propio YAML.",
+        "description": "Auto-detectado desde el schema real de DPs del dispositivo cuando está disponible (siempre revisa antes de guardar) - o elige un perfil incluido / pega tu propio YAML.",
         "data": {
           "profile_choice": "Perfil",
           "profile_yaml": "YAML de perfil"
@@ -54,7 +54,7 @@
     },
     "abort": {
       "already_configured": "Este dispositivo (o cuenta) ya está configurado.",
-      "already_in_progress": "Este dispositivo ya está esperando ser configurado - revisá tu lista de dispositivos descubiertos.",
+      "already_in_progress": "Este dispositivo ya está esperando ser configurado - revisa tu lista de dispositivos descubiertos.",
       "unsupported_protocol_version": "Este dispositivo usa protocolo Tuya 3.4/3.5, todavía no implementado - ver el README/CHANGELOG del proyecto para el estado."
     }
   },
@@ -69,7 +69,7 @@
       }
     },
     "abort": {
-      "account_entry_no_options": "Las entradas de cuenta no tienen nada que configurar acá - eliminá y volvé a agregar para cambiar las credenciales."
+      "account_entry_no_options": "Las entradas de cuenta no tienen nada que configurar aquí - elimina y vuelve a agregar para cambiar las credenciales."
     }
   }
 }
