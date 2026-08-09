@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.10.0 - locate legacy devices by MAC; protocol 3.2 support
+
+Continued testing directly against the live account and LAN.
+
+**Protocol 3.2 was rejected outright** by the constructor, so a 3.2
+device could not be used at all. The reference supports it
+(`set_version()`: *"3.2 behaves like 3.3 with type_0d"*) - it frames
+exactly like 3.3 but starts in the type_0d dialect. Added.
+
+**Protocol 3.1 was encrypting payloads it must send in the clear.** In
+the reference's `_encode_message` the chain is `if 3.4 / elif >= 3.2 /
+elif cmd == CONTROL` with NO trailing else, so on 3.1 every command that
+is not CONTROL (DP_QUERY, HEART_BEAT) goes out as PLAIN JSON. Sending
+those encrypted means a 3.1 device receives a query it cannot parse and
+never answers.
+
+**New: locate legacy devices by their MAC.** Tuya's older 20-character
+device ids end in the device's own MAC - `03636268ec64c9d1cacc` is the
+device at `ec:64:c9:d1:ca:cc`. Verified against three live devices, each
+resolving to the correct host straight out of the ARP cache (one of them
+at an address the port sweep had not even reported).
+
+This matters because those legacy devices are precisely the ones that
+stop broadcasting after boot, so passive discovery never sees them - and
+brute force cannot help either, for a reason measured here directly: **a
+Tuya device serves exactly ONE LAN session at a time.** A second client's
+TCP connect is accepted and then simply never answered (verified:
+connection A kept working and answering while a concurrent connection B
+timed out on every query, A unaffected). Reading the ARP cache costs
+nothing, is exact rather than a guess, and - unlike probing - touches no
+device and cannot disturb an existing session. It now runs first, before
+any sweep.
+
 ## v0.9.2 - findings from testing against the real account and LAN
 
 First session run directly against the live account and network rather

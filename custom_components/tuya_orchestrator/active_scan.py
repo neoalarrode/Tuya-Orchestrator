@@ -34,7 +34,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import re
 import socket
+import subprocess
 from typing import Any
 
 from .const import DEFAULT_PORT, DOMAIN
@@ -45,6 +47,8 @@ _LOGGER = logging.getLogger(__name__)
 TCP_PROBE_TIMEOUT = 0.3  # seconds - just checking if the port is open at all
 IDENTIFY_TIMEOUT = 3.0  # seconds - a real connect + status() round trip
 SWEEP_CONCURRENCY = 50
+# Tuya's legacy device-id format: 20 chars ending in the device's own MAC.
+_LEGACY_ID_LEN = 20
 
 
 def _guess_local_ip() -> str | None:
@@ -60,6 +64,69 @@ def _guess_local_ip() -> str | None:
         return None
     finally:
         sock.close()
+
+
+def _arp_table() -> dict[str, str]:
+    """{normalized_mac: ip} from the host's ARP cache. Blocking - run via
+    executor. Reads /proc/net/arp where available (Linux/HAOS, no
+    subprocess needed) and falls back to `arp -an` elsewhere."""
+    table: dict[str, str] = {}
+    try:
+        with open("/proc/net/arp", encoding="utf-8") as fh:
+            for line in fh.readlines()[1:]:  # skip header
+                parts = line.split()
+                if len(parts) >= 4 and parts[3] != "00:00:00:00:00:00":
+                    table[parts[3].replace(":", "").lower()] = parts[0]
+        if table:
+            return table
+    except OSError:
+        pass
+
+    try:
+        out = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
+            ["arp", "-an"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return table
+    for match in re.finditer(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]+)", out):
+        ip, mac = match.group(1), match.group(2)
+        try:
+            # `arp -an` prints single-digit octets unpadded ("6" not "06")
+            normalized = "".join(f"{int(p, 16):02x}" for p in mac.split(":"))
+        except ValueError:
+            continue
+        table[normalized] = ip
+    return table
+
+
+def resolve_by_mac(device_ids: list[str], arp: dict[str, str]) -> dict[str, str]:
+    """{device_id: ip} for every LEGACY-format device id whose embedded MAC
+    is in the ARP cache.
+
+    MEASURED ON A REAL ACCOUNT: Tuya's older 20-character device ids end in
+    the device's own MAC address - e.g. `03636268ec64c9d1cacc` is the
+    device at MAC `ec:64:c9:d1:ca:cc`. Verified against three live devices
+    (two air conditioners and a heater), each resolving to the right host.
+
+    This matters because those legacy devices are exactly the ones that
+    stop broadcasting after boot, so passive discovery never sees them -
+    and brute-force identification cannot help either: a Tuya device serves
+    only ONE LAN session at a time, so once something is connected to it
+    (Home Assistant itself, typically) every probe just times out, however
+    correct the key is. Reading the ARP cache costs nothing, touches no
+    device, cannot steal a session, and is exact rather than a guess.
+
+    Newer 22-character ids (`bf...`) do NOT embed a MAC - those devices are
+    left to broadcast discovery and the port sweep as before.
+    """
+    resolved: dict[str, str] = {}
+    for device_id in device_ids:
+        if len(device_id) != _LEGACY_ID_LEN:
+            continue
+        ip = arp.get(device_id[-12:].lower())
+        if ip:
+            resolved[device_id] = ip
+    return resolved
 
 
 async def _tcp_port_open(ip: str, port: int, timeout: float) -> bool:
@@ -159,6 +226,41 @@ async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, tuple
     the version comes from whichever probe in `_PROBE_VERSIONS` actually
     worked, never assumed."""
     loop = asyncio.get_event_loop()
+
+    # FIRST: resolve whatever we can from the ARP cache - free, instant,
+    # exact, and it touches no device (see resolve_by_mac's docstring for
+    # why "touches no device" is the important part). Only legacy 20-char
+    # ids can be resolved this way; everything else falls through to the
+    # sweep below.
+    matches: dict[str, tuple[str, str]] = {}
+    arp = await loop.run_in_executor(None, _arp_table)
+    by_mac = resolve_by_mac([c["device_id"] for c in candidates], arp)
+    keys = {c["device_id"]: c["local_key"] for c in candidates}
+    for device_id, ip in by_mac.items():
+        version = await _try_identify(ip, device_id, keys[device_id])
+        if version is not None:
+            matches[device_id] = (ip, version)
+            _LOGGER.info(
+                "Active scan: resolved %s to %s via its MAC in the ARP cache (protocol %s)",
+                device_id,
+                ip,
+                version,
+            )
+        else:
+            # Still worth reporting: we know exactly where it is, we just
+            # could not talk to it - almost always because something else
+            # (usually this very integration) holds its single LAN session.
+            _LOGGER.debug(
+                "Active scan: %s is at %s per ARP but did not answer - its single "
+                "LAN session is likely already held by another connection",
+                device_id,
+                ip,
+            )
+
+    candidates = [c for c in candidates if c["device_id"] not in matches]
+    if not candidates:
+        return matches
+
     local_ip = await loop.run_in_executor(None, _guess_local_ip)
     if not local_ip:
         _LOGGER.warning("Active scan: could not determine the local IP/subnet, aborting")
@@ -199,7 +301,6 @@ async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, tuple
             )
         open_hosts = [ip for ip in open_hosts if ip not in configured_addresses]
 
-    matches: dict[str, tuple[str, str]] = {}
     for ip in open_hosts:
         still_needed = [c for c in candidates if c["device_id"] not in matches]
         if not still_needed:

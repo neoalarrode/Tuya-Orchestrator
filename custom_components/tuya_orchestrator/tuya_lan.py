@@ -154,10 +154,10 @@ class TuyaLocalDevice:
         port: int = 6668,
         on_update: Callable[[dict[int, Any]], None] | None = None,
     ) -> None:
-        if protocol_version not in ("3.1", "3.3", "3.4"):
+        if protocol_version not in ("3.1", "3.2", "3.3", "3.4"):
             raise NotImplementedError(
                 f"Tuya protocol {protocol_version} is not implemented "
-                "(supported: 3.1, 3.3, 3.4)."
+                "(supported: 3.1, 3.2, 3.3, 3.4)."
             )
         self.device_id = device_id
         self.address = address
@@ -208,7 +208,12 @@ class TuyaLocalDevice:
         # switched at runtime the first time the device answers a DP_QUERY
         # with "data unvalid", exactly as the reference does - there is no
         # way to know in advance, and no cloud metadata field for it.
-        self.dev_type = DEV_TYPE_0A
+        # GAP FIXED HERE: protocol 3.2 was rejected outright by the
+        # constructor above, so a 3.2 device could not be used at all. The
+        # reference supports it in `set_version()`: 3.2 frames exactly like
+        # 3.3 but starts in the type_0d dialect rather than type_0a
+        # ("3.2 behaves like 3.3 with type_0d" - its own comment).
+        self.dev_type = DEV_TYPE_0D if protocol_version == "3.2" else DEV_TYPE_0A
         # {"1": None, "2": None, ...} - the explicit DP list a type_0d
         # device requires in its query. Populated via add_dps_to_request()
         # from the device's profile (the reference fills it from the
@@ -566,7 +571,7 @@ class TuyaLocalDevice:
                 # is prepended to the already-encrypted ciphertext.
                 payload = self.version_header + payload
             payload = self._encrypt_raw(payload, pad_data=True)
-        elif self.protocol_version == "3.3":
+        elif self.protocol_version in ("3.2", "3.3"):
             # BUG FIXED HERE (found by diffing against the reference):
             # this header was missing entirely on both send and receive
             # for a long time - every set_dps() control command would
@@ -581,8 +586,16 @@ class TuyaLocalDevice:
                 pre_md5 = b"data=" + enc_b64 + b"||lpv=3.1||" + self.real_local_key
                 digest = hashlib.md5(pre_md5).hexdigest()
                 payload = b"3.1" + digest[8:24].encode("latin1") + enc_b64
-            else:
-                payload = self._encrypt_raw(payload, pad_data=True)
+            # else: NO encryption at all. BUG FIXED HERE - this branch used
+            # to encrypt like 3.3 does. In the reference's _encode_message
+            # the version chain is `if 3.4 / elif >= 3.2 / elif cmd ==
+            # CONTROL` with NO trailing else, so on 3.1 every command that
+            # is not CONTROL (DP_QUERY, HEART_BEAT...) goes out as PLAIN
+            # JSON. Sending those encrypted means a 3.1 device receives a
+            # query it cannot parse and simply never answers - which is not
+            # a theory: probing this account's real 3.1-era devices from
+            # the LAN with correct keys timed out on every single one,
+            # while the 3.3/3.4 devices answered immediately.
 
         self._seq += 1
         seq = self._seq
