@@ -37,7 +37,7 @@ import logging
 import socket
 from typing import Any
 
-from .const import DEFAULT_PORT
+from .const import DEFAULT_PORT, DOMAIN
 from .tuya_lan import TuyaLocalDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -98,7 +98,16 @@ async def _sweep_open_hosts(subnet: ipaddress.IPv4Network, port: int) -> list[st
 # all, or - worse - "succeed" while actually talking the wrong protocol
 # (which is exactly what produced an "always unknown" symptom before
 # tuya_lan.py's 3.4 support was ported in).
-_PROBE_VERSIONS = ("3.3", "3.4")
+#
+# BUG FIXED HERE (found while probing a real account from the LAN): 3.1
+# was missing from this tuple entirely, so a 3.1 device could never be
+# identified by an active scan no matter how reachable it was. That is
+# not a hypothetical generation - this account's older, short-device-id
+# equipment (two air conditioners, a heater, a power strip) is exactly
+# that vintage, and those are also the devices least likely to broadcast,
+# i.e. the ones that depend on active scanning in the first place. 3.3 is
+# still tried first as the most common generation.
+_PROBE_VERSIONS = ("3.3", "3.4", "3.1")
 
 
 async def _try_identify(ip: str, device_id: str, local_key: str) -> str | None:
@@ -164,6 +173,31 @@ async def active_scan(hass, candidates: list[dict[str, Any]]) -> dict[str, tuple
     )
     open_hosts = await _sweep_open_hosts(subnet, DEFAULT_PORT)
     _LOGGER.debug("Active scan: %d host(s) with port %s open: %s", len(open_hosts), DEFAULT_PORT, open_hosts)
+
+    # MEASURED ON REAL HARDWARE: a Tuya device serves exactly ONE LAN
+    # session at a time. A second client's TCP connect is ACCEPTED but the
+    # device then never answers it - verified directly against a live
+    # device here (connection A kept working and answering; a concurrent
+    # connection B connected and then timed out on every query, while A
+    # was unaffected). So probing a host whose session this integration
+    # already holds can only ever time out - it is guaranteed dead time,
+    # now multiplied by every protocol version in _PROBE_VERSIONS and
+    # every candidate key. Skip those hosts outright: a device we are
+    # already connected to is by definition not one we are looking for.
+    configured_addresses = {
+        entry.data["address"]
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.data.get("address")
+    }
+    if configured_addresses:
+        skipped = [ip for ip in open_hosts if ip in configured_addresses]
+        if skipped:
+            _LOGGER.debug(
+                "Active scan: skipping %d host(s) already configured as devices: %s",
+                len(skipped),
+                skipped,
+            )
+        open_hosts = [ip for ip in open_hosts if ip not in configured_addresses]
 
     matches: dict[str, tuple[str, str]] = {}
     for ip in open_hosts:

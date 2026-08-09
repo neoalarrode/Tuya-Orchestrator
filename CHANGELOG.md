@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.9.2 - findings from testing against the real account and LAN
+
+First session run directly against the live account and network rather
+than from reports. 18 cloud devices, 4 broadcasting (3x protocol 3.4,
+1x 3.3), 9 hosts with the LAN port open.
+
+**Confirmed working against real hardware for the first time:** protocol
+3.4's session-key handshake negotiated successfully on all three 3.4
+devices and returned real DP data, as did the 3.3 device. Until now 3.4
+had only ever been verified against synthetic frames.
+
+**Measured, and it changes how scanning must behave:** a Tuya device
+serves exactly ONE LAN session at a time. A second client's TCP connect
+is ACCEPTED but the device then never answers it - verified directly
+(connection A kept working; a concurrent connection B connected and then
+timed out on every query, while A was unaffected). This is why a device
+already connected by Home Assistant looks unreachable to anything else
+probing it, despite an open port.
+
+**Two bugs fixed:**
+
+1. `_PROBE_VERSIONS` was `("3.3", "3.4")` - **protocol 3.1 was never
+   probed at all**, so a 3.1 device could not be identified by an active
+   scan however reachable it was. Not hypothetical: this account's older,
+   short-device-id equipment (two air conditioners, a heater, a power
+   strip) is that vintage, and those are also the devices least likely to
+   broadcast - i.e. exactly the ones that depend on active scanning.
+2. The scan probed every open host including ones already configured as
+   devices. Given the single-session behaviour above, those probes can
+   only ever time out - guaranteed dead time, now multiplied by every
+   protocol version and every candidate key. Hosts already configured are
+   skipped: a device we are already connected to is by definition not one
+   we are looking for.
+
 ## v0.9.1 - say WHY a connection dropped
 
 From a real report: the `connection lost - waiting for discovery
