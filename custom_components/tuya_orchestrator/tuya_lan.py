@@ -77,20 +77,40 @@ CMD_STATUS = 0x0A  # a.k.a. "DP_QUERY" in the reference - kept this name
 CMD_SESS_KEY_NEG_START = 0x03
 CMD_SESS_KEY_NEG_RESP = 0x04
 CMD_SESS_KEY_NEG_FINISH = 0x05
-CMD_CONTROL_NEW = 0x0D  # protocol 3.4's CONTROL
+CMD_CONTROL_NEW = 0x0D  # protocol 3.4's CONTROL, and type_0d's DP_QUERY
 CMD_DP_QUERY_NEW = 0x10  # protocol 3.4's DP_QUERY
+CMD_UPDATEDPS = 0x12  # ask the device to refresh/re-report the given DPs
 
 # Commands that do NOT get the 3.3/3.4 plaintext version header prepended.
 _NO_HEADER_CMDS = frozenset(
     {
         CMD_STATUS,
         CMD_DP_QUERY_NEW,
+        CMD_UPDATEDPS,
         CMD_HEARTBEAT,
         CMD_SESS_KEY_NEG_START,
         CMD_SESS_KEY_NEG_RESP,
         CMD_SESS_KEY_NEG_FINISH,
     }
 )
+
+# "Device type", exactly as the reference names it. Not a product
+# category - it selects which DP_QUERY dialect the device speaks:
+#
+# - type_0a (default): answers a normal DP_QUERY (0x0A) with all its DPs.
+# - type_0d: rejects DP_QUERY with a "data unvalid" payload and instead
+#   requires CONTROL_NEW (0x0D) carrying an EXPLICIT list of the DPs being
+#   asked for (`{"dps": {"1": null, "2": null, ...}}`). Such a device
+#   simply never reports state under the type_0a path - which looks
+#   exactly like a device that pairs fine but whose entities stay empty
+#   forever. The reference detects this at runtime from the error payload
+#   and transparently re-sends; ported here in `_decode_frame_payload`
+#   (detection) and `status()` (the one-shot retry).
+DEV_TYPE_0A = "type_0a"
+DEV_TYPE_0D = "type_0d"
+
+# DPs the reference considers safe to refresh via UPDATEDPS (0x12).
+UPDATE_DPS_WHITELIST = (18, 19, 20)
 
 _VERSION_HEADER_TAIL = b"\x00" * 12  # follows the "3.3"/"3.4" version bytes
 
@@ -178,6 +198,16 @@ class TuyaLocalDevice:
         # instead of leaving stale values on screen - localtuya does the
         # equivalent via its `disconnected()` callback dispatching None.
         self._on_disconnect: "Callable[[], None] | None" = None
+        # See DEV_TYPE_0A/DEV_TYPE_0D. Starts optimistic (type_0a) and is
+        # switched at runtime the first time the device answers a DP_QUERY
+        # with "data unvalid", exactly as the reference does - there is no
+        # way to know in advance, and no cloud metadata field for it.
+        self.dev_type = DEV_TYPE_0A
+        # {"1": None, "2": None, ...} - the explicit DP list a type_0d
+        # device requires in its query. Populated via add_dps_to_request()
+        # from the device's profile (the reference fills it from the
+        # configured entity list, same idea).
+        self.dps_to_request: dict[str, Any] = {}
         # 3.4 session-key negotiation state. The fixed nonce matches the
         # reference implementation exactly - security here rests on the
         # local_key's secrecy plus the HMAC exchange, not nonce randomness.
@@ -275,7 +305,20 @@ class TuyaLocalDevice:
 
     async def heartbeat(self) -> None:
         obj = {"gwId": self.device_id, "devId": self.device_id}
-        await self._send_receive_json(CMD_HEARTBEAT, obj)
+        # BUG FIXED HERE: this waited on the echoed SEQUENCE NUMBER like
+        # every other command. The reference has an explicit hack for
+        # exactly this case, with the reason in a comment:
+        #     "Heartbeats on protocols < 3.3 respond with sequence number 0,
+        #      so they can't be waited for like other messages."
+        # (its HEARTBEAT_SEQNO sentinel, dispatched by COMMAND instead).
+        # Without it, on a 3.1 device every heartbeat waited on a seqno the
+        # device never echoes, timed out after 10s, and _heartbeat_loop
+        # read that timeout as a dead connection and tore down a perfectly
+        # healthy socket - every 10 seconds, forever. Wait by command, which
+        # is correct for all versions, not just the broken one.
+        await self._send_receive_raw(
+            CMD_HEARTBEAT, self._build_payload(obj), wait_cmd=CMD_HEARTBEAT
+        )
 
     async def _heartbeat_loop(self) -> None:
         # GAP FIXED HERE (found reviewing the reference's
@@ -320,8 +363,50 @@ class TuyaLocalDevice:
             self._on_disconnect()
 
     # -- public API -------------------------------------------------------------
+    def add_dps_to_request(self, dp_ids) -> None:
+        """Register which DPs to ask for explicitly. Only type_0d devices
+        actually need this, but it is harmless to populate always - and it
+        must be populated BEFORE the first status() in case this device
+        turns out to be type_0d (the reference wires it the same way, from
+        the configured entity list, at device-construction time)."""
+        if isinstance(dp_ids, int):
+            self.dps_to_request[str(dp_ids)] = None
+        else:
+            self.dps_to_request.update({str(i): None for i in dp_ids})
+
     async def status(self) -> dict[int, Any]:
-        """Query current DP values."""
+        """Query current DP values, transparently handling a device that
+        turns out to speak the type_0d dialect (see DEV_TYPE_0D)."""
+        before = self.dev_type
+        dps = await self._status_once()
+        if self.dev_type != before:
+            # _decode_frame_payload just detected "data unvalid" and
+            # switched us to type_0d. The reference re-sends the same
+            # command exactly once on a dev_type change; do the same, now
+            # that _status_once() will use the CONTROL_NEW dialect.
+            _LOGGER.debug(
+                "%s: device type changed %s -> %s, re-sending status query",
+                self.device_id,
+                before,
+                self.dev_type,
+            )
+            dps = await self._status_once()
+        return dps
+
+    async def _status_once(self) -> dict[int, Any]:
+        if self.dev_type == DEV_TYPE_0D and self.protocol_version != "3.4":
+            # type_0d: DP_QUERY is overridden to CONTROL_NEW and must carry
+            # the explicit DP list. `dps_to_request` deliberately goes out
+            # even if empty - matches the reference, and an empty list is
+            # still a valid (if useless) query rather than a crash.
+            obj = {
+                "devId": self.device_id,
+                "uid": self.device_id,
+                "t": str(int(time.time())),
+                "dps": self.dps_to_request,
+            }
+            reply = await self._send_receive_json(CMD_CONTROL_NEW, obj)
+            return _extract_dps(reply)
         if self.protocol_version == "3.4":
             # 3.4 uses DP_QUERY_NEW with a 3-field payload (no gwId) -
             # ported from the reference's "v3.4" payload_dict override.
@@ -557,18 +642,47 @@ class TuyaLocalDevice:
                 if decrypted.startswith(self.version_bytes):
                     decrypted = decrypted[len(self.version_header) :]
                 text = decrypted.decode("utf-8")
-            elif self.protocol_version == "3.1" and raw.startswith(b"3.1"):
-                # skip "3.1" (3 bytes) + 16-byte MD5-hexdigest signature
-                text = self._decrypt_raw(raw[19:]).decode("utf-8")
+            elif raw.startswith(b"3.1"):
+                # "3.1" (3 bytes) + 16-byte MD5-hexdigest signature, then a
+                # BASE64-encoded ciphertext.
+                # BUG FIXED HERE: the base64 layer was missing entirely -
+                # the reference's AESCipher.decrypt() takes `use_base64`
+                # and this is the ONE call site that leaves it at its
+                # default True (the 3.3/3.4 paths all pass False). Without
+                # it a 3.1 device's every reply failed to decrypt and was
+                # swallowed as an undecodable frame, so a 3.1 device could
+                # never report state at all. Note the check is on the
+                # PAYLOAD prefix, not on self.protocol_version: a device
+                # configured as 3.3 can still answer in this shape.
+                text = self._decrypt_raw(base64.b64decode(raw[19:])).decode("utf-8")
             else:  # 3.3 (or 3.1 non-CONTROL replies, same shape as 3.3)
                 payload = raw
                 if payload[: len(self.version_header)] == self.version_header:
+                    payload = payload[len(self.version_header) :]
+                elif self.dev_type == DEV_TYPE_0D and (len(payload) & 0x0F) != 0:
+                    # type_0d heuristic, ported verbatim from the reference:
+                    # these devices prepend the version header WITHOUT the
+                    # version bytes matching, so the only tell is that the
+                    # remaining length isn't an AES block multiple.
                     payload = payload[len(self.version_header) :]
                 if payload[:1] == b"{" and payload[-1:] == b"}":
                     text = payload.decode("utf-8")  # already-plaintext ack/edge case
                 else:
                     text = self._decrypt_raw(payload).decode("utf-8")
         except Exception:  # noqa: BLE001 - malformed/heartbeat-ack/undecodable frame
+            return None
+
+        # GAP FIXED HERE: the reference switches dev_type the moment a
+        # device answers with this specific error - it is the ONLY signal
+        # that this device speaks the type_0d dialect (see DEV_TYPE_0D).
+        # Without this the reply was just unparseable JSON, discarded
+        # silently, and the device reported state forever. status() sees
+        # the changed dev_type and re-sends in the right dialect.
+        if "data unvalid" in text:
+            self.dev_type = DEV_TYPE_0D
+            _LOGGER.debug(
+                "%s: 'data unvalid' from device - switching to %s", self.device_id, DEV_TYPE_0D
+            )
             return None
 
         try:

@@ -279,6 +279,27 @@ class DeviceProfile:
     def dps_for_platform(self, platform: str) -> list[DPMapping]:
         return [d for d in self.dps if d.platform == platform]
 
+    def all_dp_ids(self) -> list[int]:
+        """Every DP id this profile touches, plain and composite alike.
+
+        Needed for `TuyaLocalDevice.add_dps_to_request()`: a "type_0d"
+        device won't answer a plain DP_QUERY at all - it requires the query
+        to name the DPs explicitly (see DEV_TYPE_0D in tuya_lan.py). The
+        reference builds this same list from its configured entity list;
+        here the profile IS the entity list, so it must contribute the
+        composite mappings' DPs too, not just the flat `dps:` entries -
+        a device whose entities are all composite (a bare vacuum or
+        climate profile) would otherwise register an EMPTY request list
+        and report nothing.
+        """
+        ids: set[int] = {d.dp_id for d in self.dps}
+        composites: list[Any] = [*self.lights, *self.climates, *self.vacuums]
+        for mapping in composites:
+            for field_name, value in vars(mapping).items():
+                if field_name.endswith("_dp") and isinstance(value, int):
+                    ids.add(value)
+        return sorted(ids)
+
 
 def _int_or_none(value: Any) -> int | None:
     """Coerce an optional dp_id-like field to int. BUG FIXED HERE: composite

@@ -21,14 +21,20 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
 from .account import async_setup_account
 from .const import (
+    CONF_ACCESS_ID,
+    CONF_ACCESS_SECRET,
     CONF_DEVICE_ID,
     CONF_ENTRY_TYPE,
     CONF_LOCAL_KEY,
     CONF_PROFILE_YAML,
     CONF_PROTOCOL_VERSION,
+    CONF_REGION,
     CONF_SCAN_INTERVAL,
+    CONF_UID,
     DEFAULT_SCAN_INTERVAL,
     DISCOVERY_DATA_KEY,
     DOMAIN,
@@ -39,6 +45,7 @@ from .const import (
 from .coordinator import TuyaOrchestratorCoordinator
 from .discovery import DiscoveredDevice, PersistentDiscovery
 from .profile import parse_profile
+from .tuya_cloud import TuyaCloudApi
 from .tuya_lan import TuyaLocalDevice
 
 _LOGGER = logging.getLogger(__name__)
@@ -152,6 +159,51 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+async def _async_refresh_local_key(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Re-fetch this device's local_key from the Tuya cloud and rewrite the
+    entry if it changed. Returns True only if a genuinely DIFFERENT key was
+    stored (i.e. retrying is now worthwhile). Best-effort: any failure just
+    returns False, leaving the original connection error to be reported."""
+    device_id = entry.data.get(CONF_DEVICE_ID)
+    account = next(
+        (
+            e
+            for e in hass.config_entries.async_entries(DOMAIN)
+            if e.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_ACCOUNT
+        ),
+        None,
+    )
+    if account is None or device_id is None:
+        return False
+
+    try:
+        api = TuyaCloudApi(
+            async_get_clientsession(hass),
+            account.data[CONF_REGION],
+            account.data[CONF_ACCESS_ID],
+            account.data[CONF_ACCESS_SECRET],
+        )
+        devices = await api.get_user_devices(account.data[CONF_UID])
+    except Exception as err:  # noqa: BLE001 - purely a recovery attempt
+        _LOGGER.debug("Could not refresh local_key for %s: %s", device_id, err)
+        return False
+
+    fresh = next((d for d in devices if d["device_id"] == device_id), None)
+    if fresh is None or not fresh.get("local_key"):
+        return False
+    if fresh["local_key"] == entry.data.get(CONF_LOCAL_KEY):
+        return False  # key is fine - the connection failed for another reason
+
+    _LOGGER.info(
+        "Tuya Orchestrator: local_key for %s changed in the cloud (device re-paired?) - updating",
+        device_id,
+    )
+    new_data = dict(entry.data)
+    new_data[CONF_LOCAL_KEY] = fresh["local_key"]
+    hass.config_entries.async_update_entry(entry, data=new_data)
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_ACCOUNT:
         await async_setup_account(hass, entry)
@@ -169,6 +221,11 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
         local_key=data[CONF_LOCAL_KEY],
         protocol_version=data.get(CONF_PROTOCOL_VERSION, "3.3"),
     )
+    # Must be registered BEFORE the first status(): if this device turns
+    # out to speak the type_0d dialect, its very first query already needs
+    # the explicit DP list (see DEV_TYPE_0D in tuya_lan.py). The reference
+    # wires this identically, from its configured entity list.
+    device.add_dps_to_request(profile.all_dp_ids())
     # BUG FIXED HERE: a connection failure (device briefly offline, reset,
     # 3.4 handshake failure...) used to propagate as a raw exception - HA
     # logs that as a scary "Error setting up entry" traceback and does NOT
@@ -180,6 +237,19 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     try:
         await device.connect()
     except Exception as err:  # noqa: BLE001
+        # GAP FIXED HERE (vs the reference's `update_local_key()`): Tuya
+        # rotates a device's local_key whenever it is re-paired from the
+        # phone app - a completely routine thing for a user to do. With a
+        # stale key the LAN handshake fails forever and the only fix was
+        # deleting and re-adding the device by hand. The reference
+        # re-fetches the key from the cloud and rewrites the entry; do the
+        # same, on a best-effort basis (it needs an account entry to be
+        # configured, and it only helps if the key genuinely changed).
+        if await _async_refresh_local_key(hass, entry):
+            raise ConfigEntryNotReady(
+                f"local_key for {data[CONF_DEVICE_ID]} was stale and has been refreshed from "
+                "the Tuya cloud; retrying with the new key"
+            ) from err
         raise ConfigEntryNotReady(f"Could not connect to {data[CONF_DEVICE_ID]} at {entry.data['address']}: {err}") from err
 
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)

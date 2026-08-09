@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.8.0 - full line-by-line diff of the reference protocol layer
+
+The remaining gap: previous versions diffed `discovery.py` and the
+connection lifecycle, but `pytuya/__init__.py` (the protocol layer) had
+only ever been checked in pieces, as individual bugs came up. This is the
+complete pass over it, plus the device-layer features that were missing.
+
+**Four real bugs found:**
+
+1. **Heartbeat tore down healthy connections on protocol 3.1.** The
+   reference carries an explicit hack here, with the reason in a comment:
+   *"Heartbeats on protocols < 3.3 respond with sequence number 0, so they
+   can't be waited for like other messages"* - it dispatches heartbeat
+   replies by COMMAND via a `HEARTBEAT_SEQNO` sentinel. This code waited
+   on the echoed sequence number like every other command, so on a 3.1
+   device every heartbeat waited for a seqno the device never sends, timed
+   out after 10s, and `_heartbeat_loop` read that timeout as a dead
+   connection - killing a perfectly healthy socket every 10 seconds,
+   forever. Now waits by command (correct on every version). Verified with
+   a test that replies with seqno 0: the heartbeat resolves and the
+   connection survives.
+2. **`type_0d` devices were entirely unsupported.** Some devices reject a
+   normal `DP_QUERY` with a `"data unvalid"` payload and require
+   `CONTROL_NEW` (0x0D) carrying an EXPLICIT list of the DPs being asked
+   for. There is no cloud metadata field for this - the reference detects
+   it at runtime from that error payload, switches `dev_type`, and
+   re-sends once. Without it such a device pairs perfectly and then
+   reports **nothing, forever**. Ported in full: `dev_type`,
+   `dps_to_request`, `add_dps_to_request()`, runtime detection in
+   `_decode_frame_payload`, the one-shot re-send in `status()`, and the
+   `(len(payload) & 0x0F) != 0` header-strip heuristic. `DeviceProfile`
+   gained `all_dp_ids()` (including composite mappings' DPs, not just flat
+   `dps:` entries - a bare vacuum/climate profile would otherwise register
+   an empty request list) and `__init__.py` registers it before the first
+   query.
+3. **Protocol 3.1 replies never decoded.** The reference's
+   `AESCipher.decrypt()` takes a `use_base64` flag; the 3.1 path is the
+   one call site that leaves it at its default `True`. This code was
+   missing the base64 layer entirely, so every 3.1 reply failed to decrypt
+   and was swallowed as an undecodable frame - a 3.1 device could never
+   report state at all. Also corrected the check to look at the payload
+   prefix rather than the configured protocol version, matching the
+   reference (a device configured as 3.3 can still answer in this shape).
+4. **`local_key` was never refreshed.** Tuya rotates a device's local_key
+   whenever it is re-paired from the phone app - routine user behavior.
+   With a stale key the LAN handshake fails forever and the only fix was
+   deleting and re-adding the device. The reference re-fetches it from the
+   cloud and rewrites the entry (`update_local_key()`); ported as
+   `_async_refresh_local_key()`, attempted on connection failure and
+   reported through `ConfigEntryNotReady` so HA retries with the new key.
+
+Also aligned: `UPDATEDPS` (0x12) added to the no-version-header command
+set, matching the reference's `NO_PROTOCOL_HEADER_CMDS`.
+
+**Confirmed equivalent** (checked, no change needed): payload templates
+for every command, the space-stripped JSON encoding (`separators=(",",
+":")` vs the reference's `.replace(" ", "")` - the device rejects payloads
+with spaces), frame packing/parsing including the retcode field, the CRC32
+vs HMAC-SHA256 footer split, the 3.4 session-key negotiation, the 3.4
+`data.dps` unwrapping, and the unsolicited-status dispatch path.
+
 ## v0.7.0 - automatic IP re-resolution and reconnect, no more remove/re-add
 
 Reported live: after a device's DHCP lease renewed with a new IP, the
