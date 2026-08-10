@@ -214,6 +214,23 @@ class TuyaLocalDevice:
         # instead of leaving stale values on screen - localtuya does the
         # equivalent via its `disconnected()` callback dispatching None.
         self._on_disconnect: "Callable[[], None] | None" = None
+        # Consecutive-failure backoff. GAP FIXED HERE, found on a live
+        # instance: a battery-powered outdoor watering valve went 14+
+        # minutes with EVERY reconnect attempt failing at the 3.4 handshake
+        # (SESS_KEY_NEG_START sent, zero replies, ever) while ICMP ping to
+        # the same host showed 0% loss - consistent with a weak/marginal
+        # WiFi link that can lose a larger handshake reply while still
+        # answering tiny ICMP echoes, or a device declining to renegotiate
+        # too soon after a prior attempt. Either way, __init__.py has THREE
+        # independent reconnect triggers (initial setup, the periodic
+        # timer, every broadcast heard while disconnected) and none of them
+        # backed off - a struggling device got hammered with a fresh
+        # handshake attempt roughly every 10-15s, forever, with no
+        # increasing gap to give a marginal link (or the device itself) any
+        # room to recover. `next_retry_at()` below is consulted by both
+        # reconnect paths before attempting.
+        self._consecutive_failures = 0
+        self._last_attempt_at = 0.0
         # See DEV_TYPE_0A/DEV_TYPE_0D. Starts optimistic (type_0a) and is
         # switched at runtime the first time the device answers a DP_QUERY
         # with "data unvalid", exactly as the reference does - there is no
@@ -236,6 +253,24 @@ class TuyaLocalDevice:
         self._local_nonce = b"0123456789abcdef"
         self._remote_nonce = b""
 
+    def seconds_until_retry(self) -> float:
+        """How much longer to wait before the next reconnect ATTEMPT should
+        be made, given recent consecutive failures. 0 means "go ahead now".
+
+        The first couple of failures get no delay at all - a device that
+        just rebooted or had one bad packet should reconnect as fast as the
+        existing triggers allow, which is the whole point of reacting to
+        every broadcast. Backoff only kicks in once failures are clearly a
+        pattern, not a blip, and is capped well under any single caller's
+        own patience (RECONNECT_INTERVAL is 60s) so a struggling device is
+        still retried, just not hammered.
+        """
+        if self._consecutive_failures < 3:
+            return 0.0
+        backoff = min(30.0 * (2 ** (self._consecutive_failures - 3)), 600.0)
+        remaining = self._last_attempt_at + backoff - time.time()
+        return max(0.0, remaining)
+
     # -- connection lifecycle -------------------------------------------------
     async def connect(self, timeout: float = 5.0, retries: int = 3) -> None:
         """Establish the LAN connection. Safe to call concurrently from any
@@ -245,7 +280,14 @@ class TuyaLocalDevice:
         async with self._connect_lock:
             if self._is_closing or self.connected:
                 return
-            await self._connect_locked(timeout, retries)
+            self._last_attempt_at = time.time()
+            try:
+                await self._connect_locked(timeout, retries)
+            except Exception:
+                self._consecutive_failures += 1
+                raise
+            else:
+                self._consecutive_failures = 0
 
     async def _connect_locked(self, timeout: float, retries: int) -> None:
         # Real report: a fresh connect() to a just-discovered device failed

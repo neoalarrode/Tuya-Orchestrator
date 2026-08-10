@@ -166,11 +166,27 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             stored = hass.data.get(DOMAIN, {}).get(entry.entry_id)
             local_device = stored.get("device") if isinstance(stored, dict) else None
             if local_device is not None and not local_device.connected:
-                _LOGGER.debug(
-                    "Tuya Orchestrator: heard from disconnected device %s, reconnecting now",
-                    device.device_id,
-                )
-                hass.async_create_task(_async_try_connect(local_device))
+                wait = local_device.seconds_until_retry()
+                if wait > 0:
+                    # See TuyaLocalDevice.seconds_until_retry()'s docstring:
+                    # a device with several consecutive failures gets left
+                    # alone until its backoff expires, rather than getting a
+                    # fresh handshake attempt on every single broadcast it
+                    # emits (which, for a device that broadcasts every few
+                    # seconds, meant essentially continuous hammering).
+                    _LOGGER.debug(
+                        "Tuya Orchestrator: heard from disconnected device %s, but backing "
+                        "off for %.0fs more after %d consecutive failures",
+                        device.device_id,
+                        wait,
+                        local_device._consecutive_failures,  # noqa: SLF001
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Tuya Orchestrator: heard from disconnected device %s, reconnecting now",
+                        device.device_id,
+                    )
+                    hass.async_create_task(_async_try_connect(local_device))
             break
 
     listener = PersistentDiscovery(on_device=_on_device_seen)
@@ -189,6 +205,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 continue
             device: TuyaLocalDevice = stored["device"]
             if device.connected:
+                continue
+            if device.seconds_until_retry() > 0:
                 continue
             _LOGGER.debug("Tuya Orchestrator: retrying connection to %s", device.device_id)
             await _async_try_connect(device)

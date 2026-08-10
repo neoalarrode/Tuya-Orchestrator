@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.13.0 - back off after repeated reconnect failures
+
+Diagnosed on a live instance: a battery-powered outdoor watering valve
+(protocol 3.4) went 14+ minutes with EVERY reconnect attempt failing at
+the session-key handshake - `SESS_KEY_NEG_START` sent, zero replies,
+ever - while a plain ICMP ping to the same host showed 0% loss. Whatever
+the exact cause (a marginal WiFi link losing a larger handshake reply
+while still answering tiny ICMP echoes, or the device declining to
+renegotiate too soon after a previous attempt), the integration was not
+helping: it has THREE independent reconnect triggers (initial setup, the
+60s periodic timer, every broadcast heard while disconnected), and NONE
+of them backed off. A struggling device got a fresh handshake attempt
+roughly every 10-15s, forever, with no increasing gap to give a marginal
+link - or the device itself - any room to recover.
+
+`TuyaLocalDevice` now tracks consecutive connection failures.
+`seconds_until_retry()` returns 0 for the first two failures (a device
+that just rebooted or hit one bad packet should still reconnect as fast
+as possible - that's the whole point of reacting to every broadcast), and
+from the third failure on, backs off exponentially (30s, 60s, 120s...
+capped at 10 minutes) until a connection actually succeeds. Both
+reconnect paths in `__init__.py` now consult it before attempting.
+
+This does not by itself explain every disconnect - a separate live
+capture showed a working, correctly-configured 3.3 heater get an outright
+`ConnectionResetError` from the device itself after functioning normally
+for several minutes, a different failure mode from the 3.4 handshake
+timeout above. Both share the same root problem this release addresses
+(no breathing room between attempts), but the underlying reason a healthy
+connection resets on its own remains open.
+
 ## v0.12.3 - show WHAT is being written, not just that a write happened
 
 Investigating a live report of many devices dropping connection led to a
