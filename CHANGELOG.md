@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.13.2 - reconnect the instant a device disconnects
+
+Reported directly: recovery needs to happen immediately, not eventually.
+
+Until now, nothing tried reconnecting AT THE MOMENT a device dropped.
+`coordinator.py`'s disconnect hook only marked entities unavailable;
+actual recovery depended entirely on either the next broadcast heard
+from that device (which some devices send rarely or not at all) or the
+60s periodic sweep - so a disconnect landing right after that sweep just
+ran could sit unavailable for up to a minute for no reason, when the
+disconnect itself is already the strongest possible signal to try again
+right now.
+
+A second listener is now chained onto the same disconnect callback: the
+coordinator's own hook still runs first (marks unavailable immediately),
+then a reconnect is scheduled instantly - still gated by
+`seconds_until_retry()` (v0.13.0), so a device already failing
+repeatedly still backs off instead of being hammered on every drop.
+Verified: a normal disconnect schedules a reconnect immediately; a
+disconnect while backed off does not, but the coordinator is still
+notified either way.
+
 ## v0.13.1 - the read side was dying silently on a real disconnect
 
 Root cause of the "healthy heater suddenly resets" case left open in

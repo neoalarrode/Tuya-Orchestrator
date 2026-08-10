@@ -321,6 +321,30 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
 
     scan_interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     coordinator = TuyaOrchestratorCoordinator(hass, device, profile, scan_interval)
+
+    # GAP FIXED HERE: until now, nothing reconnected a device the MOMENT
+    # it disconnected. coordinator.py's own _on_disconnect hook only marks
+    # entities unavailable - recovery depended entirely on either the next
+    # broadcast heard from that device (_on_device_seen, below) or the 60s
+    # periodic sweep (_async_reconnect, below), so a device that
+    # broadcasts rarely (or a disconnect landing right after the periodic
+    # sweep just ran) could sit unavailable for up to a minute for no
+    # reason - the connection dropping is ALREADY the strongest possible
+    # signal to try again now. Chain a second listener onto the same
+    # single-slot callback: the coordinator's own hook still runs first
+    # (marks unavailable immediately), then this one schedules an instant
+    # reconnect attempt - still through seconds_until_retry(), so a device
+    # failing repeatedly still backs off instead of being hammered.
+    coordinator_on_disconnect = device._on_disconnect  # noqa: SLF001
+
+    def _reconnect_now() -> None:
+        if coordinator_on_disconnect is not None:
+            coordinator_on_disconnect()
+        if device.seconds_until_retry() > 0:
+            return
+        hass.async_create_task(_async_try_connect(device))
+
+    device._on_disconnect = _reconnect_now  # noqa: SLF001
     try:
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:
