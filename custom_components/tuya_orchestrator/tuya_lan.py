@@ -651,17 +651,27 @@ class TuyaLocalDevice:
             await self._writer.drain()
 
     async def _send_receive_json(self, command: int, obj: dict[str, Any]) -> TuyaMessage:
-        return await self._send_receive_raw(command, self._build_payload(obj))
+        # For CONTROL/CONTROL_NEW, which DPs are being WRITTEN is exactly
+        # the question when something is writing far more often than any
+        # user plausibly clicked - preview it (plaintext, our own outgoing
+        # data, no secrets in it) rather than only being able to see that a
+        # write happened.
+        preview = ""
+        if command in (CMD_CONTROL, CMD_CONTROL_NEW):
+            dps = obj.get("dps") or obj.get("data", {}).get("dps")
+            if dps:
+                preview = f" dps={dps}"
+        return await self._send_receive_raw(command, self._build_payload(obj), extra_note=preview)
 
     async def _send_receive_raw(
-        self, command: int, raw_payload: bytes, wait_cmd: int | None = None
+        self, command: int, raw_payload: bytes, wait_cmd: int | None = None, extra_note: str = ""
     ) -> TuyaMessage:
         if not self.connected:
             await self.connect()
         packet, seq, _hmac_key = self._encode_message(command, raw_payload)
         self._trace_add(
             "tx", seq, command, packet,
-            f"awaiting {'cmd 0x%02x' % wait_cmd if wait_cmd is not None else 'seq %d' % seq}",
+            f"awaiting {'cmd 0x%02x' % wait_cmd if wait_cmd is not None else 'seq %d' % seq}{extra_note}",
         )
 
         fut: asyncio.Future = asyncio.get_event_loop().create_future()

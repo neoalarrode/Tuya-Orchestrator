@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.12.3 - show WHAT is being written, not just that a write happened
+
+Investigating a live report of many devices dropping connection led to a
+genuinely alarming pattern in the frame trace of one AC: a continuous
+stream of CONTROL writes (`0x07`), two back-to-back, every 100-300ms,
+non-stop for over an hour - clearly not a person clicking a thermostat
+that fast. The trace could show THAT something kept writing, but not
+WHAT, which is the one thing needed to find the source (a runaway
+automation, a UI feedback loop, or a bug in this integration itself).
+
+`_send_receive_json()` now previews the DPs being written (plaintext -
+this is our own outgoing data, not a secret) alongside CONTROL/
+CONTROL_NEW frames in the trace. Next diagnostics download from an
+affected device will show exactly what is being set on every write,
+which turns "something is writing a lot" into "X keeps getting set to Y".
+
 ## v0.12.2 - stop dropping spontaneous reports; make an unreadable device say so
 
 Two findings from reviewing live diagnostics for two misbehaving devices.
