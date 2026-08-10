@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.13.1 - the read side was dying silently on a real disconnect
+
+Root cause of the "healthy heater suddenly resets" case left open in
+v0.13.0.
+
+`_listen()`'s read loop caught `ConnectionResetError`/`OSError` from
+`_reader.read()` and just `pass`ed - the task quietly ended, but nothing
+else happened: `_teardown()` was never called, `_on_disconnect` was never
+notified, and `connected` kept reporting `True` (only the writer's state
+is checked, and nothing had touched it). With nobody reading anymore,
+every pending reply just sat there until its own 10s timeout, and no
+push update could ever arrive again.
+
+The only thing that eventually noticed was the heartbeat loop, on its
+NEXT write - up to a full `HEARTBEAT_INTERVAL` (10s) later, sometimes
+more. That is exactly the delay between "the device actually dropped the
+connection" and "connection lost (ConnectionResetError: Connection lost)"
+finally getting logged, seen on a live heater that had been working
+normally for several minutes beforehand: the write side, not the read
+side, was what the log ultimately blamed, when the read side had already
+died first and said nothing.
+
+A clean EOF (`read()` returning `b""`, i.e. the device closed its end
+without resetting) fell through the same silent gap.
+
+Both paths now report through a single `_handle_connection_lost()`,
+called immediately from wherever the drop is actually detected - no more
+waiting for the next heartbeat to notice a connection that already died.
+Verified with a test: a read that raises `ConnectionResetError` now
+tears the connection down and fires `_on_disconnect` immediately, where
+before it left `connected` reporting `True` forever.
+
+This explains why detection was slow and inconsistent; it does not by
+itself explain why the device resets the connection in the first place,
+which may simply be normal behavior for this class of device.
+
 ## v0.13.0 - back off after repeated reconnect failures
 
 Diagnosed on a live instance: a battery-powered outdoor watering valve

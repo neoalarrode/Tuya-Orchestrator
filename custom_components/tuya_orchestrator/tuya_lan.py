@@ -427,18 +427,40 @@ class TuyaLocalDevice:
         # "Disconnected - waiting for discovery broadcast" (which is also
         # literally what happens next here now: __init__.py reconnects on
         # the device's next broadcast, or on the RECONNECT_INTERVAL tick).
-        # The REASON used to be debug-only, so a real report of this warning
-        # said a connection dropped but gave nothing to act on. It belongs
-        # in the message itself.
+        # Detach ourselves first: _teardown() cancels _heartbeat_task, and
+        # this code IS that task - cancelling the currently-running task
+        # would throw CancelledError into our own remaining awaits.
+        self._heartbeat_task = None
+        # Idempotency guard: `_listen()`'s read side can independently
+        # detect the same drop (see `_handle_connection_lost`'s docstring)
+        # and may have already torn the connection down by the time this
+        # runs - `_writer` is None once that's happened. Without this check
+        # a near-simultaneous read+write failure would log the "connection
+        # lost" warning and call `_on_disconnect` twice for one drop.
+        if self._writer is not None:
+            self._handle_connection_lost(reason)
+
+    def _handle_connection_lost(self, reason: str) -> None:
+        # GAP FIXED HERE, and a real one: this used to be inline in
+        # _heartbeat_loop only. `_listen()`'s own read loop independently
+        # catches ConnectionResetError/OSError from `_reader.read()` and,
+        # until now, just returned - silently. The read task would be gone,
+        # `connected` would still report True (the writer wasn't touched),
+        # every pending reply would sit until its own SEND_TIMEOUT expired
+        # one at a time, and NOTHING was logged or reported to the
+        # coordinator until the next outgoing heartbeat's write/drain also
+        # happened to fail - up to a full HEARTBEAT_INTERVAL (10s) later,
+        # sometimes more. A real report of a device resetting the
+        # connection on its own (`ConnectionResetError: Connection lost`)
+        # traced back to exactly this: the WRITE side eventually noticed
+        # and handled it correctly, but the READ side had already died
+        # silently, doing nothing, for however long that gap was. Both
+        # sides now report through this single path immediately.
         _LOGGER.warning(
             "%s: connection lost (%s) - waiting for discovery broadcast or periodic retry",
             self.device_id,
             reason,
         )
-        # Detach ourselves first: _teardown() cancels _heartbeat_task, and
-        # this code IS that task - cancelling the currently-running task
-        # would throw CancelledError into our own remaining awaits.
-        self._heartbeat_task = None
         self._teardown()
         if self._on_disconnect is not None:
             self._on_disconnect()
@@ -863,8 +885,31 @@ class TuyaLocalDevice:
                         dps = _extract_dps(parsed)
                         if dps:
                             self._on_update(dps)
-        except (asyncio.CancelledError, ConnectionResetError, OSError):
-            pass
+        except asyncio.CancelledError:
+            return
+        except (ConnectionResetError, OSError) as err:
+            # See _handle_connection_lost's docstring: this used to be a
+            # silent `pass` here, leaving the connection looking healthy
+            # (`connected` still True) with nobody reading it anymore until
+            # the next outgoing heartbeat's write happened to fail too.
+            if not self._is_closing and self._writer is not None:
+                # Detach ourselves first, same reasoning as
+                # _heartbeat_loop's detach: _teardown() cancels
+                # _listen_task, and this code IS that task - cancelling the
+                # currently-running task would throw CancelledError into
+                # our own return below. _heartbeat_task is a DIFFERENT
+                # task, so _teardown() cancelling that one is a normal,
+                # safe cross-task cancellation.
+                self._listen_task = None
+                self._handle_connection_lost(f"{type(err).__name__}: {err}")
+            return
+        # A clean EOF (`chunk == b""` above) is also a real disconnect -
+        # the device closed its end without resetting - and was silently
+        # falling through to nothing for the same reason as the except
+        # branch above.
+        if not self._is_closing and self._writer is not None:
+            self._listen_task = None
+            self._handle_connection_lost("device closed the connection (EOF)")
 
     def _decode_frame_payload(self, raw: bytes) -> dict | None:
         """Version-aware payload decode, ported from the reference's
