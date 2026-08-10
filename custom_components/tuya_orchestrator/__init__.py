@@ -11,6 +11,7 @@ Two kinds of ConfigEntry:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -300,6 +301,46 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     # will retry" status and actually retries on HA's own schedule.
     try:
         await device.connect()
+    except asyncio.CancelledError as err:
+        # BUG FIXED HERE, and a real one: `except Exception` does NOT catch
+        # this - CancelledError has inherited from BaseException, not
+        # Exception, since Python 3.8, specifically so a bare `except
+        # Exception` can never accidentally swallow a real cancellation.
+        # But that means a cancellation reaching here escaped uncaught,
+        # past ConfigEntryNotReady entirely, straight to HA's own
+        # entry-setup wrapper - which then marks the entry `setup_error`
+        # instead of the auto-retried `setup_retry`. `setup_error` entries
+        # do NOT retry on their own; they sit dead until someone manually
+        # reloads them or restarts Home Assistant outright.
+        #
+        # Confirmed live, on two devices at once: HA's own bootstrap has a
+        # startup-phase timeout ("Something is blocking Home Assistant
+        # from wrapping up the start up phase..." - logged the SAME
+        # moment, naming OTHER slow integrations, not this one) and
+        # cancels whichever entry setups are still in flight when it
+        # fires. A 3.4 device mid-handshake, waiting inside
+        # `asyncio.wait_for(..., timeout=SEND_TIMEOUT)`, was exactly what
+        # was in flight - so the cancellation landed here. This is not
+        # this device actually failing; it is Home Assistant's own startup
+        # running long for unrelated reasons and asking every in-progress
+        # setup to yield. The correct, and only self-healing, response is
+        # the same one used for a real connect failure: ConfigEntryNotReady,
+        # so HA retries this entry on its own schedule shortly after
+        # startup finishes, instead of leaving it dead until a full
+        # restart. (Swallowing the cancellation here is deliberate and
+        # safe: nothing further runs before this coroutine returns, so
+        # there is no risk of ignoring cancellation mid-operation - this
+        # IS the return path HA's cancellation was asking for, just
+        # reported through the entry-retry mechanism instead of a bare,
+        # unretried error.)
+        hass.data.setdefault(DOMAIN, {}).setdefault(FAILED_TRACES_KEY, {})[
+            entry.entry_id
+        ] = _snapshot_failure(device, err)
+        await device.close()
+        raise ConfigEntryNotReady(
+            f"Setup of {data[CONF_DEVICE_ID]} was cancelled (Home Assistant's own startup "
+            "was still busy with other integrations) - will retry"
+        ) from err
     except Exception as err:  # noqa: BLE001
         hass.data.setdefault(DOMAIN, {}).setdefault(FAILED_TRACES_KEY, {})[
             entry.entry_id
@@ -347,6 +388,18 @@ async def _async_setup_device_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     device._on_disconnect = _reconnect_now  # noqa: SLF001
     try:
         await coordinator.async_config_entry_first_refresh()
+    except asyncio.CancelledError as err:
+        # Same reasoning as the connect() branch above - the first status
+        # poll is just as capable of being caught mid-flight by HA's own
+        # busy-startup cancellation as the connect handshake was.
+        hass.data.setdefault(DOMAIN, {}).setdefault(FAILED_TRACES_KEY, {})[
+            entry.entry_id
+        ] = _snapshot_failure(device, err)
+        await device.close()
+        raise ConfigEntryNotReady(
+            f"First refresh of {data[CONF_DEVICE_ID]} was cancelled (Home Assistant's own "
+            "startup was still busy with other integrations) - will retry"
+        ) from err
     except Exception as err:
         hass.data.setdefault(DOMAIN, {}).setdefault(FAILED_TRACES_KEY, {})[
             entry.entry_id

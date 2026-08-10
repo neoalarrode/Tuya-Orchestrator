@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.13.3 - a busy Home Assistant startup was permanently killing device entries
+
+Reported directly: two auto-discovered devices ("Pasillo abajo", "WiFi
+Watering Pump 2") could never connect, stuck forever. Their traceback:
+
+```
+File ".../tuya_lan.py", line 765, in _send_receive_raw
+    return await asyncio.wait_for(fut, timeout=SEND_TIMEOUT)
+asyncio.exceptions.CancelledError
+```
+
+`asyncio.CancelledError` has inherited from `BaseException`, not
+`Exception`, since Python 3.8 - specifically so a bare `except Exception`
+can never accidentally swallow a real cancellation. This integration's
+own `except Exception` around `device.connect()` therefore let it pass
+straight through, uncaught, bypassing `ConfigEntryNotReady` entirely -
+and Home Assistant's own entry-setup wrapper marks an entry that fails
+this way `setup_error`, not the auto-retried `setup_retry`.
+`setup_error` entries do not retry on their own; they sit dead until
+someone manually reloads them or restarts Home Assistant outright.
+
+Where the cancellation actually came from, confirmed from the SAME
+moment in the log: Home Assistant's own bootstrap has a startup-phase
+timeout (`"Something is blocking Home Assistant from wrapping up the
+start up phase..."`, logged simultaneously and naming OTHER slow
+integrations, not this one) that cancels whichever entry setups are
+still in flight when it fires. A 3.4 device mid-handshake, waiting on
+`SEND_TIMEOUT`, was exactly what was in flight on both affected entries.
+This is not a device failing - it is Home Assistant's own startup taking
+too long for unrelated reasons and asking every in-progress setup to
+yield, and this integration was treating that cooperative request as a
+fatal, unretried error.
+
+Both the connect and first-refresh paths now catch `CancelledError`
+specifically and convert it to `ConfigEntryNotReady`, so a device
+cancelled by a busy startup retries on Home Assistant's own schedule
+shortly after, instead of sitting dead until a full restart. Verified
+with a test reproducing the exact cancellation shape.
+
+This may also explain part of the separately-reported frequent Core
+restarts: an entry stuck in `setup_error` does not self-heal, and a full
+Home Assistant restart was likely the only thing that appeared to fix it
+- which would explain restarts recurring on a system that is already
+slow to boot.
+
 ## v0.13.2 - reconnect the instant a device disconnects
 
 Reported directly: recovery needs to happen immediately, not eventually.
