@@ -358,9 +358,29 @@ class TuyaLocalDevice:
         # everyone still waiting on a reply that can no longer arrive,
         # instead of leaving each to burn its full 10s timeout on a socket
         # already known to be gone.
+        #
+        # BUG FIXED HERE, and a real one: this used `fut.cancel()`, which
+        # is semantically wrong for "the connection died" - cancellation
+        # means the WAITER'S OWN caller asked to stop, not that the
+        # answer will never come. `asyncio.CancelledError` inherits from
+        # BaseException specifically so ordinary `except Exception`
+        # handling never swallows it; a caller mid-3.4-handshake (the
+        # common victim, since v0.13.1 made the read side notice a drop
+        # immediately instead of dying silently) saw that CancelledError
+        # escape uncaught past its own error handling, all the way out of
+        # connect() as an opaque, unactionable exception - reproduced
+        # live: a device that accepts the TCP connection, receives
+        # SESS_KEY_NEG_START, then drops the connection (EOF) before
+        # replying - plausibly the same weak/marginal link flagged in
+        # v0.13.0 - turned into a bare CancelledError on every single
+        # attempt, delete-and-re-add included, because THIS teardown path
+        # produced it fresh every time, regardless of who was asking or
+        # how long they were willing to wait. A real connection failure
+        # instead of a cancellation.
+        conn_lost = TuyaProtocolError("connection lost while awaiting a reply")
         for fut in (*self._pending.values(), *self._pending_cmd.values()):
             if not fut.done():
-                fut.cancel()
+                fut.set_exception(conn_lost)
         self._pending.clear()
         self._pending_cmd.clear()
         self.local_key = self.real_local_key  # reset any negotiated 3.4 session key

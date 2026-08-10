@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.13.4 - the REAL cause of the permanently-stuck devices: my own v0.13.1 fix
+
+v0.13.3 diagnosed the wrong scope. The user deleted and re-added one of
+the stuck devices - a live action, not a Home Assistant restart - and it
+failed the exact same way, which the bootstrap-timeout theory cannot
+explain (bootstrap isn't running during a live re-add). Reproduced
+standalone, outside Home Assistant entirely, with logging proof:
+
+```
+connection lost (device closed the connection (EOF)) - waiting for discovery broadcast or periodic retry
+...
+asyncio.exceptions.CancelledError
+```
+
+The device accepts the TCP connection, receives `SESS_KEY_NEG_START`,
+then drops the connection (EOF) before replying - plausibly the same
+weak/marginal link flagged in v0.13.0. v0.13.1 (shipped hours earlier in
+this same session) made the read side notice that drop immediately
+instead of dying silently, which was correct - but `_teardown()`'s
+cleanup of in-flight waiters used `fut.cancel()`, which is semantically
+wrong for "the connection died": cancellation means the waiter's own
+caller asked to stop, not that the answer will never come. The 3.4
+handshake, waiting on exactly such a future, saw a bare
+`asyncio.CancelledError` escape - which v0.13.3 correctly stopped from
+crashing the entry permanently, but the UNDERLYING problem was reproducing
+on every single attempt, delete-and-re-add included, because this
+teardown path manufactured a fresh CancelledError every time, regardless
+of who was asking or how long they were willing to wait.
+
+`_teardown()` now completes in-flight waiters with a proper
+`TuyaProtocolError("connection lost while awaiting a reply")` instead of
+cancelling them - a normal, catchable exception with a clear cause.
+Verified against the live device: three consecutive attempts now each
+fail with that clear error (the device is still dropping the connection -
+a separate, real link/device issue - but the ERROR REPORTING is now
+correct, which is what was actually broken).
+
 ## v0.13.3 - a busy Home Assistant startup was permanently killing device entries
 
 Reported directly: two auto-discovered devices ("Pasillo abajo", "WiFi
